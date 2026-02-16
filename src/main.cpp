@@ -1,61 +1,118 @@
 #include <Arduino.h>
 #include <IO7F8266.h>
 
-// Variable obligatoria para la librería
+// --- CONFIGURACIÓN DE PINES ---
+const uint8_t pinPulso = 13;    // D7 - Contacto NO (Sensor de giro)
+const uint8_t pinEstado = 5;     // D1 - Contacto NC (Estado auxiliar)
+const uint8_t ledPin = LED_BUILTIN; // LED interno para feedback visual
+
+// --- VARIABLES DE CONTROL ---
+volatile unsigned long contadorPulsos = 0;
+unsigned long pulsosAnteriores = 0;
+volatile unsigned long ultimoTiempoInterrupcion = 0;
+const uint8_t tiempoDebounce = 20; // 20ms para filtrar ruido eléctrico
+
+// Variables obligatorias para la librería IO7
 String user_html = "";
-
-// Prefijo para el nombre del AP de configuración
 char* ssid_pfix = (char*)"IOT_Device";
+unsigned long lastPublishMillis = 0;
 
-// Control de tiempo para publicación
-unsigned long lastPublishMillis = -pubInterval;
+// --- FUNCIÓN DE INTERRUPCIÓN (D7) ---
+void IRAM_ATTR conteoGiro() {
+    unsigned long tiempoActual = millis();
+    if (tiempoActual - ultimoTiempoInterrupcion > tiempoDebounce) {
+        contadorPulsos++;
+        ultimoTiempoInterrupcion = tiempoActual;
+    }
+}
 
+// --- FUNCIÓN DE ENVÍO DE DATOS ---
 void publishData() {
-    StaticJsonDocument<512> root;
+    // Feedback visual: Enciende LED (LOW en ESP8266 es encendido)
+    digitalWrite(ledPin, LOW);
+
+    StaticJsonDocument<384> root; 
     JsonObject data = root.createNestedObject("d");
     
-    // --- AGREGA TUS DATOS AQUÍ ---
-    data["status"] = "running";
-    // Ejemplo: data["temperatura"] = lectura;
-    // ----------------------------
+    // Captura segura del contador
+    noInterrupts();
+    unsigned long copiaPulsos = contadorPulsos;
+    interrupts();
 
-    serializeJson(root, msgBuffer);
-    if (client.publish(evtTopic, msgBuffer)) {
-        Serial.println("Evento enviado a IO7 OK");
-    } else {
-        Serial.println("Error al enviar a IO7");
+    unsigned long deltaPulsos = copiaPulsos - pulsosAnteriores;
+    pulsosAnteriores = copiaPulsos;
+
+    // Diagnóstico del sistema
+    long rssi = WiFi.RSSI(); 
+    uint32_t uptime = millis() / 1000;
+    uint32_t freeMem = ESP.getFreeHeap();
+
+    // Estructura del JSON para Node-RED
+    data["v"] = copiaPulsos;     // Vueltas totales (Acumulado)
+    data["d"] = deltaPulsos;     // Vueltas en el último periodo
+    data["s1"] = digitalRead(pinPulso);
+    data["s2"] = digitalRead(pinEstado);
+    data["rssi"] = rssi;         // Intensidad de señal WiFi
+    data["up"] = uptime;         // Tiempo encendido (Segundos)
+    data["mem"] = freeMem;       // RAM libre (Salud del chip)
+    data["status"] = "online";
+    
+    if (client.connected()) {
+        serializeJson(root, msgBuffer);
+        client.publish(evtTopic, msgBuffer); 
+        Serial.printf("Enviado -> V:%lu | RSSI:%ld | Up:%lu s\n", copiaPulsos, rssi, uptime);
     }
+
+    // Apagar LED de feedback
+    digitalWrite(ledPin, HIGH);
 }
 
+// --- MANEJO DE CONFIGURACIÓN DESDE PLATAFORMA ---
 void handleUserMeta() {
-    // Sincroniza el intervalo de publicación con la plataforma
     if (cfg["meta"].containsKey("pubInterval")) {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
-        Serial.printf("Intervalo actualizado: %d ms\n", pubInterval);
+        Serial.printf("Intervalo actualizado a: %d ms\n", pubInterval);
     }
 }
 
+// --- MANEJO DE COMANDOS DESDE NODE-RED / IO7 ---
 void handleUserCommand(char* topic, JsonDocument* root) {
-    // --- AGREGA LÓGICA DE COMANDOS AQUÍ ---
-    // Ejemplo: Si recibes "on", encender un relevador
+    JsonObject d = (*root)["d"];
+    
+    // Comando para resetear vueltas: {"reset": 1}
+    if (d.containsKey("reset")) {
+        contadorPulsos = 0;
+        pulsosAnteriores = 0;
+        Serial.println("Contador reseteado por comando.");
+    }
+
+    // Comando para reiniciar hardware: {"reboot": 1}
+    if (d.containsKey("reboot")) {
+        Serial.println("Reiniciando ESP8266...");
+        delay(500);
+        ESP.restart();
+    }
 }
 
 void setup() {
     Serial.begin(115200);
+    
+    // Configuración de Hardware
+    pinMode(pinPulso, INPUT); 
+    pinMode(pinEstado, INPUT);
+    pinMode(ledPin, OUTPUT);
+    digitalWrite(ledPin, HIGH); // Inicia apagado
 
-    // --- CONFIGURA TUS PINES AQUÍ (pinMode) ---
+    // Activar interrupción en D7
+    attachInterrupt(digitalPinToInterrupt(pinPulso), conteoGiro, RISING);
 
-    // Inicialización del dispositivo y carga de configuración
+    // Inicializar IO7 y Callbacks
     initDevice();
-
-    // Registro de funciones Callback
     userMeta = handleUserMeta;
     userCommand = handleUserCommand;
-
-    // Aplicar configuración inicial
     handleUserMeta();
 
-    // Intervalo de seguridad por defecto (5 segundos)
+    // Intervalo de seguridad (5 segundos por defecto)
     if (pubInterval <= 0) pubInterval = 5000;
 
     // Conexión WiFi
@@ -67,20 +124,17 @@ void setup() {
         delay(500);
         Serial.print(".");
     }
+    Serial.println("\nWiFi Conectado OK");
     
-    Serial.printf("\nConectado a: %s | IP: %s\n", (const char*)cfg["ssid"], WiFi.localIP().toString().c_str());
-
-    // Conexión al servidor IO7
     set_iot_server();
     iot_connect();
 }
 
 void loop() {
-    // Mantener conexión MQTT activa
+    // Mantener conexión MQTT
     if (!client.connected()) {
         iot_connect();
     }
-    
     client.loop();
 
     // Temporizador de publicación
