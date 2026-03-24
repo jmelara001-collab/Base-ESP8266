@@ -1,138 +1,58 @@
 #include <Arduino.h>
-#include <IO7F8266.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 
-// --- CONFIGURACIÓN DE PINES ---
-const uint8_t pinPulso = 13;    // D7 - Sensor reflectivo (Disco 8 orificios)
-const uint8_t pinEstado = 5;     // D1 - Contacto Auxiliar
-const uint8_t ledPin = LED_BUILTIN; 
+// Instancia del ADC1
+Adafruit_ADS1115 ads;
 
-// --- VARIABLES DE CONTROL ---
-volatile unsigned long contadorPulsos = 0;
-unsigned long pulsosAnterioresCheck = 0; 
-const uint8_t tiempoDebounce = 15;      // ms para evitar ruido eléctrico
-volatile unsigned long ultimoTiempoInterrupcion = 0;
-
-const unsigned long umbralParada = 500; 
-
-String user_html = "";
-char* ssid_pfix = (char*)"IOT_Device";
-unsigned long lastPublishMillis = 0;
-
-// --- FUNCIÓN DE INTERRUPCIÓN (D7) ---
-void IRAM_ATTR conteoGiro() {
-    unsigned long tiempoActual = millis();
-    if (tiempoActual - ultimoTiempoInterrupcion > tiempoDebounce) {
-        contadorPulsos++;
-        ultimoTiempoInterrupcion = tiempoActual;
-    }
-}
-
-// --- FUNCIÓN DE ENVÍO DE DATOS ---
-void publishData() {
-    digitalWrite(ledPin, LOW);
-
-    noInterrupts();
-    unsigned long copiaPulsosActual = contadorPulsos;
-    unsigned long ultimoPulsoRastreado = ultimoTiempoInterrupcion;
-    interrupts();
-
-    int estadoMaquina = 0;
-    if (copiaPulsosActual > pulsosAnterioresCheck || (millis() - ultimoPulsoRastreado < umbralParada)) {
-        estadoMaquina = 1;
-    } else {
-        estadoMaquina = 0;
-    }
-
-    pulsosAnterioresCheck = copiaPulsosActual;
-
-    StaticJsonDocument<384> root; 
-    JsonObject data = root.createNestedObject("d");
-    
-    long rssi = WiFi.RSSI(); 
-    uint32_t uptime = millis() / 1000;
-    uint32_t freeMem = ESP.getFreeHeap();
-
-    data["m_act"] = estadoMaquina;   
-    data["v_tot"] = copiaPulsosActual;
-    data["s1"] = digitalRead(pinPulso);
-    data["s2"] = digitalRead(pinEstado);
-    data["rssi"] = rssi;
-    data["up"] = uptime;
-    data["mem"] = freeMem;
-    data["status"] = "online";
-    
-    if (client.connected()) {
-        serializeJson(root, msgBuffer);
-        client.publish(evtTopic, msgBuffer); 
-        Serial.printf("Status: %d | Pulsos: %lu\n", estadoMaquina, copiaPulsosActual);
-    }
-
-    digitalWrite(ledPin, HIGH);
-}
-
-void handleUserMeta() {
-    if (cfg["meta"].containsKey("pubInterval")) {
-        pubInterval = cfg["meta"]["pubInterval"].as<int>();
-    }
-}
-
-void handleUserCommand(char* topic, JsonDocument* root) {
-    JsonObject d = (*root)["d"];
-    if (d.containsKey("reset")) {
-        noInterrupts();
-        contadorPulsos = 0;
-        pulsosAnterioresCheck = 0;
-        interrupts();
-    }
-    if (d.containsKey("reboot")) {
-        ESP.restart();
-    }
-}
+/* FACTOR DE CALIBRACIÓN (Obtenido en LTspice):
+  Entrada Real (10V) / Voltaje en A0 (1.93275V) = 5.1739
+*/
+const float FACTOR_VOLTAJE = 5.1739;
 
 void setup() {
-    Serial.begin(115200);
-    pinMode(pinPulso, INPUT); 
-    pinMode(pinEstado, INPUT);
-    pinMode(ledPin, OUTPUT);
-    digitalWrite(ledPin, HIGH);
+  Serial.begin(115200);
+  
+  // En el ESP32-S, Wire usa por defecto GPIO 21 (SDA) y 22 (SCL)
+  Wire.begin(21, 22);
 
-    attachInterrupt(digitalPinToInterrupt(pinPulso), conteoGiro, RISING);
+  Serial.println("Iniciando ADS1115...");
+  
+  if (!ads.begin()) {
+    Serial.println("¡Error! No se encontró el ADS1115. Revisa conexiones y GND.");
+    while (1);
+  }
 
-    initDevice();
-    userMeta = handleUserMeta;
-    userCommand = handleUserCommand;
-    
-    if (pubInterval <= 0) pubInterval = 5000;
+  /*
+    CONFIGURACIÓN DE GANANCIA (PGA):
+    GAIN_TWO: Rango +/- 2.048V (1 bit = 0.0625mV)
+    Como nuestra simulación dio 1.93V, este es el rango perfecto.
+  */
+  ads.setGain(GAIN_TWO); 
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
-    
-    Serial.print("Conectando a WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-
-    // --- NUEVA SECCIÓN: Información de Red ---
-    Serial.println("\n------------------------------------");
-    Serial.println("¡WiFi Conectado!");
-    Serial.print("Dirección IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Dirección MAC: ");
-    Serial.println(WiFi.macAddress());
-    Serial.println("------------------------------------");
-    // ------------------------------------------
-    
-    set_iot_server();
-    iot_connect();
+  Serial.println("ADS1115 Configurado. Leyendo 0-10V...");
 }
 
 void loop() {
-    if (!client.connected()) iot_connect();
-    client.loop();
+  int16_t adc0;
+  float volts_ads;
+  float volts_industriales;
 
-    if ((pubInterval != 0) && (millis() - lastPublishMillis > (unsigned long)pubInterval)) {
-        publishData();
-        lastPublishMillis = millis();
-    }
+  // Leer canal A0 (donde conectaste tu circuito de 0-10V)
+  adc0 = ads.readADC_SingleEnded(0);
+  
+  // Voltaje que llega físicamente al pin del ADS (debería ser ~1.93V cuando hay 10V)
+  volts_ads = ads.computeVolts(adc0);
+
+  // Aplicar factor para recuperar los 0-10V originales
+  volts_industriales = volts_ads * FACTOR_VOLTAJE;
+
+  // Salida al Monitor Serial
+  Serial.print("Voltaje en ADS: ");
+  Serial.print(volts_ads, 4);
+  Serial.print("V | Voltaje Real Sensor: ");
+  Serial.print(volts_industriales, 2);
+  Serial.println("V");
+
+  delay(1000); // Leer cada segundo
 }
