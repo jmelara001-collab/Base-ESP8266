@@ -1,99 +1,106 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 #include <IO7F8266.h>
-#include <Adafruit_MAX31865.h> 
 
-// Variable obligatoria para la librería IO7
+Adafruit_ADS1115 ads;
 String user_html = "";
-
-// Prefijo para el nombre del AP de configuración
-char* ssid_pfix = (char*)"IOT_Device";
-
-// Control de tiempo para publicación
+char* ssid_pfix = (char*)"IOT_ESP12E_Volt";
 unsigned long lastPublishMillis = -pubInterval;
 
-// --- CONFIGURACIÓN DEL SENSOR MAX31865 (PT100) ---
-// Pines SPI para ESP8266: CS(D2/GPIO4), DI/MOSI(D7/GPIO13), DO/MISO(D6/GPIO12), CLK(D5/GPIO14)
-Adafruit_MAX31865 thermo = Adafruit_MAX31865(4, 13, 12, 14);
-
-// Valores específicos para PT100
-#define RREF      430.0
-#define RNOMINAL  100.0
+// Bandera de estado del sensor
+bool adsReady = false;
 
 void publishData() {
     StaticJsonDocument<512> root;
     JsonObject data = root.createNestedObject("d");
     
-    float temperaturaActual = thermo.temperature(RNOMINAL, RREF);
-    
-    data["status"] = "running";
-    data["temperatura"] = temperaturaActual;
-    
-    uint8_t fault = thermo.readFault();
-    if (fault) {
-        data["sensor_error"] = fault;
-        Serial.printf("Error detectado: 0x%02X\n", fault);
-        thermo.clearFault();
+    float v_pin = 0.0;
+    float v_10v = 0.0;
+
+    if (adsReady) {
+        // Leer el canal 3 (A3)
+        int16_t adc_raw = ads.readADC_SingleEnded(3);
+        
+        // Voltaje real en el pin (debería ser 2.0V cuando hay 10V en la entrada)
+        v_pin = ads.computeVolts(adc_raw);
+        
+        // Conversión a escala 10V (Factor 5:1 según tu calibración)
+        v_10v = v_pin * 5.0;
     }
+
+    // Datos para la plataforma
+    data["status"] = adsReady ? "ok" : "error";
+    data["v_adc"] = v_pin;   // El voltaje que lee el chip (0-2V)
+    data["v_real"] = v_10v;  // El voltaje de tu máquina (0-10V)
 
     serializeJson(root, msgBuffer);
     if (client.publish(evtTopic, msgBuffer)) {
-        Serial.print("Evento enviado a IO7 OK | Temp: ");
-        Serial.println(temperaturaActual);
-    } else {
-        Serial.println("Error al enviar a IO7");
+        Serial.printf("Lectura Enviada -> ADC: %.3fV | Real: %.2fV\n", v_pin, v_10v);
     }
 }
 
 void handleUserMeta() {
     if (cfg["meta"].containsKey("pubInterval")) {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
-        Serial.printf("Intervalo actualizado: %d ms\n", pubInterval);
     }
 }
 
 void handleUserCommand(char* topic, JsonDocument* root) {
-    // Lógica para recibir comandos desde la plataforma si fuera necesario
+    // Espacio para lógica de control futura
 }
 
 void setup() {
     Serial.begin(115200);
+    delay(500);
 
-    // Inicializar el MAX31865 configurado para 3 hilos (común en PT100 industriales)
-    // Si tu sensor es de 2 o 4 hilos, cambia a MAX31865_2WIRE o MAX31865_4WIRE
-    thermo.begin(MAX31865_3WIRE); 
+    // Configuración I2C para ESP-12E (D2=SDA, D1=SCL)
+    Wire.begin(4, 5);
+    Wire.setClock(100000);
 
+    Serial.println("\n--- Inicializando Monitor de Voltaje ---");
+
+    // Inicializar ADS1115 en dirección 0x48 (ADDR -> GND)
+    if (!ads.begin(0x48)) {
+        Serial.println("Error: ADS1115 no encontrado. Revisa el cableado.");
+        adsReady = false;
+    } else {
+        Serial.println("ADS1115 conectado correctamente.");
+        adsReady = true;
+        // GAIN_ONE: Rango de +/- 4.096V (Perfecto para leer tus 2V con precisión)
+        ads.setGain(GAIN_ONE);
+    }
+
+    // Configuración de librería IO7
     initDevice();
-
     userMeta = handleUserMeta;
     userCommand = handleUserCommand;
-
     handleUserMeta();
 
     if (pubInterval <= 0) pubInterval = 5000;
 
+    // Conexión WiFi con los datos de configuración
     WiFi.mode(WIFI_STA);
     WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
     
-    Serial.print("Conectando WiFi");
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
     
-    Serial.printf("\nConectado a: %s | IP: %s\n", (const char*)cfg["ssid"], WiFi.localIP().toString().c_str());
-
+    Serial.println("\nWiFi Conectado exitosamente.");
     set_iot_server();
     iot_connect();
 }
 
 void loop() {
+    // Mantener conexión con el servidor de IO7
     if (!client.connected()) {
         iot_connect();
     }
-    
     client.loop();
 
-    // Publicación basada en el intervalo configurado
+    // Publicación temporizada
     if ((pubInterval != 0) && (millis() - lastPublishMillis > (unsigned long)pubInterval)) {
         publishData();
         lastPublishMillis = millis();
