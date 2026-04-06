@@ -1,125 +1,193 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_ADS1X15.h>
-#include <IO7F8266.h>
+#include <WiFi.h>      
+#include <IO7F32.h>    
 
-// --- CONFIGURACIÓN DE HARDWARE ---
-// R1 = 6.8k (Entrada), R2 = 3.3k (GND)
-// Factor real = (6.8 + 3.3) / 3.3 = 3.0606
-const float DIVIDER_FACTOR = 3.0606f; 
-const int MUESTRAS = 20; // Número de lecturas para promediar y quitar el ruido
+// ---------------------------------------------------------------------------
+// CONFIGURACIÓN BÁSICA IO7
+// ---------------------------------------------------------------------------
+String user_html = "";  
+char* ssid_pfix = (char*)"IOT_DEVICE";
 
-Adafruit_ADS1115 ads;
-String user_html = "";
-char* ssid_pfix = (char*)"IOT_ESP12E_Volt";
-unsigned long lastPublishMillis = -pubInterval;
+unsigned long lastPublishMillis = 0;
+int defaultPubIntervalMs = 5000;
 
-bool adsReady = false;
+// ---------------------------------------------------------------------------
+// PINES DEL SENSOR (ESP32)
+// ---------------------------------------------------------------------------
+const int PIN_SENSOR = 18; 
+const int LED_PIN = 2;
 
-// Función para obtener una lectura estable (Filtro por promedio)
-float obtenerVoltajePromedio() {
-    float suma = 0;
-    for (int i = 0; i < MUESTRAS; i++) {
-        suma += ads.computeVolts(ads.readADC_SingleEnded(3));
-        delay(2); // Pequeña pausa para que el ruido cambie entre muestras
-    }
-    return suma / (float)MUESTRAS;
-}
+const unsigned long LED_PULSE_MS = 30;
+unsigned long ledOffAtMs = 0;
+volatile bool pulseBlinkFlag = false;
 
-void publishData() {
-    StaticJsonDocument<512> root;
-    JsonObject data = root.createNestedObject("d");
-    
-    float v_pin = 0.0;
-    float v_real = 0.0;
+// ---------------------------------------------------------------------------
+// VARIABLES DE MEDICIÓN Y DIAGNÓSTICO
+// ---------------------------------------------------------------------------
+volatile unsigned long lastPulseTime = 0;
+volatile unsigned long pulsePeriodUs = 0; 
+volatile bool newData = false;
 
-    if (adsReady) {
-        // Obtenemos el voltaje ya promediado (0 - 3.3V aprox)
-        v_pin = obtenerVoltajePromedio();
-        
-        // Convertimos al voltaje real de la máquina (0 - 10V+)
-        v_real = v_pin * DIVIDER_FACTOR;
-    }
+const unsigned long debounceUs = 400; 
 
-    // Datos para IO7
-    data["status"] = adsReady ? "ok" : "error";
-    data["v_adc"] = v_pin;   // Voltaje que entra al chip
-    data["v_real"] = v_real; // Voltaje real que mide el sistema
+float pps = 0;
+float rpm = 0;
+int pulsesPerRev = 7; 
+bool maquina_running = false; 
 
-    serializeJson(root, msgBuffer);
-    if (client.publish(evtTopic, msgBuffer)) {
-        Serial.print(">>> ENVIADO: ");
-        Serial.print("Pin ADC: "); Serial.print(v_pin, 3);
-        Serial.print("V | Real Maquina: "); Serial.print(v_real, 2);
-        Serial.println("V");
+// --- NUEVAS VARIABLES DE DIAGNÓSTICO ---
+uint32_t reconnecciones_wifi = 0;   // Cuántas veces se ha caído el WiFi
+uint32_t uptime_segundos = 0;      // Tiempo total desde el último reinicio
+
+// ---------------------------------------------------------------------------
+// INTERRUPCIÓN (ISR)
+// ---------------------------------------------------------------------------
+IRAM_ATTR void onPulse() {
+    unsigned long now = micros();
+    unsigned long timeDifference = now - lastPulseTime;
+    if (timeDifference > debounceUs) {
+        pulsePeriodUs = timeDifference; 
+        lastPulseTime = now;
+        pulseBlinkFlag = true;
+        newData = true; 
     }
 }
 
+// ---------------------------------------------------------------------------
+// HANDLERS IO7
+// ---------------------------------------------------------------------------
 void handleUserMeta() {
     if (cfg["meta"].containsKey("pubInterval")) {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
+        if (pubInterval < 200) pubInterval = 200;
     }
 }
 
-void handleUserCommand(char* topic, JsonDocument* root) {
-    // Espacio para control remoto futuro
+void handleUserCommand(char* topic, JsonDocument* root) {}
+
+// ---------------------------------------------------------------------------
+// PUBLICACIÓN DE DATOS MQTT
+// ---------------------------------------------------------------------------
+void publishData() {
+    StaticJsonDocument<768> root; // Aumentamos un poco el tamaño por las nuevas variables
+    JsonObject data = root.createNestedObject("d");
+
+    // Datos de operación
+    data["pps"] = pps;
+    data["rpm"] = rpm;
+    data["running"] = maquina_running; 
+
+    // Datos de diagnóstico (El respaldo que necesitas)
+    data["uptime"] = millis() / 1000;         // Segundos desde que encendió
+    data["reconn"] = reconnecciones_wifi;     // Veces que ha fallado el WiFi
+    data["heap"]   = ESP.getFreeHeap();       // Memoria libre (para ver si se traba por falta de memoria)
+
+    data["d7_logic"] = digitalRead(PIN_SENSOR);
+    data["wifi_ok"]  = (WiFi.status() == WL_CONNECTED);
+    data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
+    data["status"] = "Online";
+
+    serializeJson(root, msgBuffer);
+
+    bool ok = false;
+    if (WiFi.status() == WL_CONNECTED && client.connected()) {
+        ok = client.publish(evtTopic, msgBuffer);
+    }
+
+    if (ok) {
+        Serial.printf("TX OK | RPM: %.2f | Uptime: %lu s | Reconn: %u\n",
+                      rpm, (millis()/1000), reconnecciones_wifi);
+    }
 }
 
+// ---------------------------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(500);
+    delay(300);
+    Serial.println("\n[BOOT] Iniciando sistema...");
 
-    // I2C para ESP-12E (GPIO 4 y 5)
-    Wire.begin(4, 5);
-    Wire.setClock(100000);
+    pinMode(PIN_SENSOR, INPUT);         
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW); 
 
-    Serial.println("\n======================================");
-    Serial.println("   SISTEMA DE MONITOREO DE VOLTAJE    ");
-    Serial.println("======================================");
+    attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), onPulse, RISING);
 
-    // Inicializar ADS1115 (ADDR a GND = 0x48)
-    if (!ads.begin(0x48)) {
-        Serial.println("ERROR: ADS1115 no encontrado. Revisa I2C.");
-        adsReady = false;
-    } else {
-        Serial.println("ADS1115 detectado correctamente.");
-        adsReady = true;
-        // GAIN_ONE: +/- 4.096V (Ideal para tu rango de 0-3.3V)
-        ads.setGain(GAIN_ONE);
-    }
-
-    // Inicializar librería IO7
     initDevice();
     userMeta = handleUserMeta;
     userCommand = handleUserCommand;
     handleUserMeta();
 
-    if (pubInterval <= 0) pubInterval = 5000;
+    if (pubInterval <= 0) pubInterval = defaultPubIntervalMs;
+    lastPublishMillis = millis() - pubInterval;
 
-    // Conexión WiFi
+    const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
+    const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
+
     WiFi.mode(WIFI_STA);
-    WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
-    
-    Serial.print("Conectando a WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    
-    Serial.println("\nConexión establecida.");
-    set_iot_server();
-    iot_connect();
+    WiFi.begin(ssid, pass);
 }
 
+// ---------------------------------------------------------------------------
+// LOOP PRINCIPAL
+// ---------------------------------------------------------------------------
 void loop() {
-    // Mantener comunicación con el servidor
-    if (!client.connected()) {
-        iot_connect();
+    // Manejo de conexión WiFi y reconexión
+    if (WiFi.status() != WL_CONNECTED) {
+        static bool wasConnected = true;
+        if (wasConnected) {
+            reconnecciones_wifi++; // Sumamos una caída
+            wasConnected = false;
+            Serial.println("[WiFi] Conexión perdida...");
+        }
+    } else {
+        // Si estamos conectados pero el cliente MQTT no
+        if (!client.connected()) {
+            static uint32_t lastTry = 0;
+            if (millis() - lastTry > 5000) {
+                iot_connect();
+                lastTry = millis();
+            }
+        }
+        client.loop();
     }
-    client.loop();
 
-    // Publicar según el intervalo configurado
-    if ((pubInterval != 0) && (millis() - lastPublishMillis > (unsigned long)pubInterval)) {
+    // Control visual del LED
+    if (pulseBlinkFlag) {
+        digitalWrite(LED_PIN, HIGH); 
+        ledOffAtMs = millis() + LED_PULSE_MS;
+        pulseBlinkFlag = false;
+    }
+    if (ledOffAtMs != 0 && millis() >= ledOffAtMs) {
+        digitalWrite(LED_PIN, LOW);  
+        ledOffAtMs = 0;
+    }
+
+    // 3. Cálculo de velocidad
+    if (newData) {
+        noInterrupts();
+        unsigned long periodo = pulsePeriodUs; 
+        newData = false;
+        interrupts();
+
+        if (periodo > 0) {
+            pps = 1000000.0f / periodo; 
+            rpm = (pulsesPerRev > 0) ? (pps * 60.0f / pulsesPerRev) : 0;
+            maquina_running = true; 
+        }
+    }
+
+    // 4. Detector de parada
+    if (micros() - lastPulseTime > 2000000) {
+        if (maquina_running) { 
+            rpm = 0; pps = 0;
+            maquina_running = false;
+        }
+    }
+
+    // 5. Publicación periódica
+    if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
         publishData();
         lastPublishMillis = millis();
     }
