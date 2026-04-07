@@ -32,7 +32,7 @@ const unsigned long debounceUs = 400;
 
 float pps = 0;
 float rpm = 0;
-int pulsesPerRev = 7; 
+int pulsesPerRev = 1; 
 bool maquina_running = false; 
 
 // --- NUEVAS VARIABLES DE DIAGNÓSTICO ---
@@ -75,14 +75,14 @@ void publishData() {
     // Datos de operación
     data["pps"] = pps;
     data["rpm"] = rpm;
-    data["running"] = maquina_running; 
+    data["running"] = maquina_running ? 1 : 0;
 
     // Datos de diagnóstico (El respaldo que necesitas)
     data["uptime"] = millis() / 1000;         // Segundos desde que encendió
     data["reconn"] = reconnecciones_wifi;     // Veces que ha fallado el WiFi
     data["heap"]   = ESP.getFreeHeap();       // Memoria libre (para ver si se traba por falta de memoria)
 
-    data["d7_logic"] = digitalRead(PIN_SENSOR);
+    data["d18_logic"] = digitalRead(PIN_SENSOR);
     data["wifi_ok"]  = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
@@ -95,8 +95,12 @@ void publishData() {
     }
 
     if (ok) {
-        Serial.printf("TX OK | RPM: %.2f | Uptime: %lu s | Reconn: %u\n",
-                      rpm, (millis()/1000), reconnecciones_wifi);
+    // Parpadeo al publicar con éxito
+    digitalWrite(LED_PIN, HIGH);
+    delay(50); // Un parpadeo rápido
+    digitalWrite(LED_PIN, LOW);
+
+    Serial.printf("TX OK | RPM: %.2f...\n", rpm);
     }
 }
 
@@ -178,13 +182,22 @@ void loop() {
         }
     }
 
-    // 4. Detector de parada
-    if (micros() - lastPulseTime > 2000000) {
-        if (maquina_running) { 
-            rpm = 0; pps = 0;
-            maquina_running = false;
-        }
+// --- 4. Detector de parada (MODIFICADO) ---
+unsigned long localLastPulse;
+
+// Protegemos la lectura de la variable volátil
+noInterrupts();
+localLastPulse = lastPulseTime;
+interrupts();
+
+if (micros() - localLastPulse > 2000000) { // Si han pasado más de 2 seg
+    if (maquina_running) { 
+        rpm = 0; 
+        pps = 0;
+        maquina_running = false;
+        Serial.println("[INFO] Máquina detenida (Timeout)");
     }
+}
 
     // 5. Publicación periódica
     if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
