@@ -35,9 +35,8 @@ float rpm = 0;
 int pulsesPerRev = 1; 
 bool maquina_running = false; 
 
-// --- NUEVAS VARIABLES DE DIAGNÓSTICO ---
-uint32_t reconnecciones_wifi = 0;   // Cuántas veces se ha caído el WiFi
-uint32_t uptime_segundos = 0;      // Tiempo total desde el último reinicio
+uint32_t reconnecciones_wifi = 0;   
+bool wifiWasConnected = false;      
 
 // ---------------------------------------------------------------------------
 // INTERRUPCIÓN (ISR)
@@ -66,24 +65,25 @@ void handleUserMeta() {
 void handleUserCommand(char* topic, JsonDocument* root) {}
 
 // ---------------------------------------------------------------------------
-// PUBLICACIÓN DE DATOS MQTT
+// PUBLICACIÓN DE DATOS MQTT (CON REDONDEO A 2 DECIMALES)
 // ---------------------------------------------------------------------------
 void publishData() {
-    StaticJsonDocument<768> root; // Aumentamos un poco el tamaño por las nuevas variables
+    StaticJsonDocument<768> root; 
     JsonObject data = root.createNestedObject("d");
 
-    // Datos de operación
-    data["pps"] = pps;
-    data["rpm"] = rpm;
+    // Redondeo a 2 decimales: Multiplicamos por 100, redondeamos y dividimos por 100.0
+    data["pps"] = round(pps * 100.0) / 100.0;
+    data["rpm"] = round(rpm * 100.0) / 100.0;
+    
     data["running"] = maquina_running ? 1 : 0;
 
-    // Datos de diagnóstico (El respaldo que necesitas)
-    data["uptime"] = millis() / 1000;         // Segundos desde que encendió
-    data["reconn"] = reconnecciones_wifi;     // Veces que ha fallado el WiFi
-    data["heap"]   = ESP.getFreeHeap();       // Memoria libre (para ver si se traba por falta de memoria)
+    // Diagnóstico
+    data["uptime"] = millis() / 1000;         
+    data["reconn"] = reconnecciones_wifi;     
+    data["heap"]   = ESP.getFreeHeap();       
 
     data["d18_logic"] = digitalRead(PIN_SENSOR);
-    data["wifi_ok"]  = (WiFi.status() == WL_CONNECTED);
+    data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
 
@@ -95,12 +95,10 @@ void publishData() {
     }
 
     if (ok) {
-    // Parpadeo al publicar con éxito
-    digitalWrite(LED_PIN, HIGH);
-    delay(50); // Un parpadeo rápido
-    digitalWrite(LED_PIN, LOW);
-
-    Serial.printf("TX OK | RPM: %.2f...\n", rpm);
+        digitalWrite(LED_PIN, HIGH);
+        delay(10); 
+        digitalWrite(LED_PIN, LOW);
+        Serial.printf("TX OK | RPM: %.2f | PPS: %.2f\n", rpm, pps);
     }
 }
 
@@ -112,7 +110,7 @@ void setup() {
     delay(300);
     Serial.println("\n[BOOT] Iniciando sistema...");
 
-    pinMode(PIN_SENSOR, INPUT);         
+    pinMode(PIN_SENSOR, INPUT);          
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW); 
 
@@ -131,22 +129,19 @@ void setup() {
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, pass);
+    
+    wifiWasConnected = (WiFi.status() == WL_CONNECTED);
 }
 
 // ---------------------------------------------------------------------------
 // LOOP PRINCIPAL
 // ---------------------------------------------------------------------------
 void loop() {
-    // Manejo de conexión WiFi y reconexión
-    if (WiFi.status() != WL_CONNECTED) {
-        static bool wasConnected = true;
-        if (wasConnected) {
-            reconnecciones_wifi++; // Sumamos una caída
-            wasConnected = false;
-            Serial.println("[WiFi] Conexión perdida...");
+    // 1. Gestión de conexión
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wifiWasConnected) {
+            wifiWasConnected = true;
         }
-    } else {
-        // Si estamos conectados pero el cliente MQTT no
         if (!client.connected()) {
             static uint32_t lastTry = 0;
             if (millis() - lastTry > 5000) {
@@ -155,9 +150,15 @@ void loop() {
             }
         }
         client.loop();
+    } 
+    else {
+        if (wifiWasConnected) {
+            reconnecciones_wifi++; 
+            wifiWasConnected = false;
+        }
     }
 
-    // Control visual del LED
+    // 2. Control visual LED
     if (pulseBlinkFlag) {
         digitalWrite(LED_PIN, HIGH); 
         ledOffAtMs = millis() + LED_PULSE_MS;
@@ -177,27 +178,24 @@ void loop() {
 
         if (periodo > 0) {
             pps = 1000000.0f / periodo; 
-            rpm = (pulsesPerRev > 0) ? (pps * 60.0f / pulsesPerRev) : 0;
+            rpm = (pps * 60.0f / pulsesPerRev);
             maquina_running = true; 
         }
     }
 
-// --- 4. Detector de parada (MODIFICADO) ---
-unsigned long localLastPulse;
+    // 4. Detector de parada
+    unsigned long localLastPulse;
+    noInterrupts();
+    localLastPulse = lastPulseTime;
+    interrupts();
 
-// Protegemos la lectura de la variable volátil
-noInterrupts();
-localLastPulse = lastPulseTime;
-interrupts();
-
-if (micros() - localLastPulse > 2000000) { // Si han pasado más de 2 seg
-    if (maquina_running) { 
-        rpm = 0; 
-        pps = 0;
-        maquina_running = false;
-        Serial.println("[INFO] Máquina detenida (Timeout)");
+    if (micros() - localLastPulse > 2000000) { 
+        if (maquina_running) { 
+            rpm = 0; 
+            pps = 0;
+            maquina_running = false;
+        }
     }
-}
 
     // 5. Publicación periódica
     if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
