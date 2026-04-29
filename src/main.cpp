@@ -12,27 +12,24 @@ uint8_t temprature_sens_read();
 #endif
 
 // --- VARIABLES PARA EL CONTROL DE REINICIO AUTOMÁTICO ---
-unsigned long wifiDownMillis = 0;       // Momento en que se perdió el WiFi
-const unsigned long RESTART_TIMEOUT = 60000; // 1 minuto en milisegundos
+unsigned long wifiDownMillis = 0;       
+const unsigned long RESTART_TIMEOUT = 10000; 
 
 String user_html = "";  
-char* ssid_pfix = (char*)"RAJADORA_3";
+char* ssid_pfix = (char*)"IOT_DEVICE";
 
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
 
-float limite_rpm = 200.0;  
-int pulsesPerRev = 8;      
+float limite_rpm = 75.0;  
+int pulsesPerRev = 4;      
 const int PIN_SENSOR = 18; 
 const int LED_PIN = 2;
 unsigned long debounceUs; 
 
-const unsigned long LED_PULSE_MS = 30;
-unsigned long ledOffAtMs = 0;
-volatile bool pulseBlinkFlag = false;
+volatile bool newData = false;
 volatile unsigned long lastPulseTime = 0;
 volatile unsigned long pulsePeriodUs = 0; 
-volatile bool newData = false;
 
 float pps = 0;
 float rpm = 0;
@@ -50,7 +47,6 @@ IRAM_ATTR void onPulse() {
     if (timeDifference > debounceUs) {
         pulsePeriodUs = timeDifference; 
         lastPulseTime = now;
-        pulseBlinkFlag = true;
         newData = true; 
     }
 }
@@ -90,16 +86,14 @@ void publishData() {
 
     serializeJson(root, msgBuffer);
 
-    bool ok = false;
     if (WiFi.status() == WL_CONNECTED && client.connected()) {
-        ok = client.publish(evtTopic, msgBuffer);
-    }
-
-    if (ok) {
-        digitalWrite(LED_PIN, HIGH);
-        delay(10); 
-        digitalWrite(LED_PIN, LOW);
-        Serial.printf("TX OK | RPM: %.2f | Temp ESP: %.1f C\n", rpm, temp_c);
+        if (client.publish(evtTopic, msgBuffer)) {
+            // INDICADOR VISUAL: Solo parpadea si se envió correctamente
+            digitalWrite(LED_PIN, HIGH);
+            delay(50); // 50ms es ideal para ver el parpadeo
+            digitalWrite(LED_PIN, LOW);
+            Serial.printf("TX OK | RPM: %.2f | Temp ESP: %.1f C\n", rpm, temp_c);
+        }
     }
 }
 
@@ -142,15 +136,11 @@ void setup() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println("\n[WIFI] ¡Conectado con éxito!");
-        Serial.print("[WIFI] Dirección IP: ");
-        Serial.println(WiFi.localIP());
-        Serial.print("[WIFI] Dirección MAC: ");
-        Serial.println(WiFi.macAddress());
         wifiWasConnected = true;
     } else {
         Serial.println("\n[WIFI] No se pudo conectar al inicio.");
         wifiWasConnected = false;
-        wifiDownMillis = millis(); // Empezamos a contar desde el boot si no conectó
+        wifiDownMillis = millis(); 
     }
 }
 
@@ -158,14 +148,12 @@ void setup() {
 // LOOP PRINCIPAL
 // ---------------------------------------------------------------------------
 void loop() {
-    // 1. GESTIÓN DE CONEXIÓN Y REINICIO DE SEGURIDAD
+    // 1. GESTIÓN DE CONEXIÓN
     if (WiFi.status() == WL_CONNECTED) {
-        // Si recuperamos la conexión, reseteamos el cronómetro de falla
         if (!wifiWasConnected) {
             wifiWasConnected = true;
             wifiDownMillis = 0; 
-            Serial.print("[WIFI] Reconectado. IP: ");
-            Serial.println(WiFi.localIP());
+            Serial.println("[WIFI] Reconectado.");
         }
 
         if (!client.connected()) {
@@ -178,35 +166,21 @@ void loop() {
         client.loop();
     } 
     else {
-        // Si se pierde la conexión
         if (wifiWasConnected) {
             reconnecciones_wifi++; 
             wifiWasConnected = false;
-            wifiDownMillis = millis(); // Marcamos el tiempo exacto de la caída
+            wifiDownMillis = millis();
             Serial.println("[WIFI] Conexión perdida...");
         }
 
-        // CONTROL DE REINICIO CRÍTICO:
-        // Si han pasado más de 3 minutos (180000 ms) sin WiFi, reiniciamos
         if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
-            Serial.println("[ALERTA] Sistema bloqueado por falta de red. Reiniciando...");
+            Serial.println("[ALERTA] Reiniciando por falta de red...");
             delay(1000);
-            ESP.restart(); // Reinicio total por software
+            ESP.restart();
         }
     }
 
-    // 2. CONTROL VISUAL LED
-    if (pulseBlinkFlag) {
-        digitalWrite(LED_PIN, HIGH); 
-        ledOffAtMs = millis() + LED_PULSE_MS;
-        pulseBlinkFlag = false;
-    }
-    if (ledOffAtMs != 0 && millis() >= ledOffAtMs) {
-        digitalWrite(LED_PIN, LOW);  
-        ledOffAtMs = 0;
-    }
-
-    // 3. CÁLCULO DE VELOCIDAD
+    // 2. CÁLCULO DE VELOCIDAD
     if (newData) {
         noInterrupts();
         unsigned long periodo = pulsePeriodUs; 
@@ -221,14 +195,11 @@ void loop() {
                 pps = pps_temp;
                 rpm = rpm_temp;
                 maquina_running = true; 
-            } else {
-                Serial.print("[FILTRO] Ruido: ");
-                Serial.println(rpm_temp);
             }
         }
     }
 
-    // 4. DETECTOR DE PARADA
+    // 3. DETECTOR DE PARADA
     unsigned long localLastPulse;
     noInterrupts();
     localLastPulse = lastPulseTime;
@@ -243,7 +214,7 @@ void loop() {
         }
     }
 
-    // 5. PUBLICACIÓN PERIÓDICA
+    // 4. PUBLICACIÓN PERIÓDICA (Aquí ocurre el parpadeo)
     if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
         publishData();
         lastPublishMillis = millis();
