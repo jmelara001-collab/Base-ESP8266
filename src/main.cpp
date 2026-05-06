@@ -22,7 +22,7 @@ unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
 
 float limite_rpm = 75;  
-int pulsesPerRev = 12;      
+int pulsesPerRev = 1;      
 const int PIN_SENSOR = 18; 
 const int LED_PIN = 2;
 unsigned long debounceUs; 
@@ -199,20 +199,22 @@ void loop() {
         }
     }
 
-    // 3. DETECTOR DE PARADA
-    unsigned long localLastPulse;
-    noInterrupts();
-    localLastPulse = lastPulseTime;
-    interrupts();
+// 3. DETECTOR DE PARADA (Ajustado para máquinas lentas)
+unsigned long localLastPulse;
+noInterrupts();
+localLastPulse = lastPulseTime;
+interrupts();
 
-    if (micros() - localLastPulse > 2000000) { 
-        if (maquina_running) { 
-            rpm = 0; 
-            pps = 0;
-            maquina_running = false;
-            Serial.println("[INFO] Máquina detenida.");
-        }
+// 10000000 us = 10 segundos. 
+// Como tu pulso llega cada 5s, esto da un margen de espera razonable.
+if (micros() - localLastPulse > 10000000) {  
+    if (maquina_running) { 
+        rpm = 0; 
+        pps = 0;
+        maquina_running = false;
+        Serial.println("[INFO] Máquina detenida (Tiempo de espera de 10s agotado).");
     }
+}
 
     // 4. PUBLICACIÓN PERIÓDICA (Aquí ocurre el parpadeo)
     if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
