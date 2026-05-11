@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>      
 #include <IO7F32.h>    
+#include <Preferences.h> // --- Librería para guardar en memoria flash ---
 
 // --- Declaración para el sensor de temperatura interno ---
 #ifdef __cplusplus
@@ -37,6 +38,12 @@ bool maquina_running = false;
 
 uint32_t reconnecciones_wifi = 0;   
 bool wifiWasConnected = false;      
+
+// --- VARIABLES PARA EL ACUMULADOR DE TIEMPO EN FLASH ---
+Preferences preferences;
+uint32_t tiempo_running_acumulado = 0; // Tiempo total en segundos
+uint32_t ultimo_tiempo_guardado = 0;
+unsigned long last_run_calc_millis = 0;
 
 // ---------------------------------------------------------------------------
 // INTERRUPCIÓN (ISR)
@@ -83,6 +90,9 @@ void publishData() {
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
+    
+    // --- Publicar el tiempo acumulado de running (en segundos) ---
+    data["run_time_sec"] = tiempo_running_acumulado;
 
     serializeJson(root, msgBuffer);
 
@@ -92,7 +102,7 @@ void publishData() {
             digitalWrite(LED_PIN, HIGH);
             delay(50); // 50ms es ideal para ver el parpadeo
             digitalWrite(LED_PIN, LOW);
-            Serial.printf("TX OK | RPM: %.2f | Temp ESP: %.1f C\n", rpm, temp_c);
+            Serial.printf("TX OK | RPM: %.2f | Temp ESP: %.1f C | Run Time: %u s\n", rpm, temp_c, tiempo_running_acumulado);
         }
     }
 }
@@ -104,6 +114,12 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n[BOOT] Iniciando sistema de monitoreo...");
+
+    // --- INICIALIZAR MEMORIA FLASH Y RECUPERAR ACUMULADO ---
+    preferences.begin("estado_maq", false);
+    tiempo_running_acumulado = preferences.getUInt("run_time", 0);
+    ultimo_tiempo_guardado = tiempo_running_acumulado;
+    Serial.printf("[NVS] Tiempo running acumulado recuperado: %u segundos\n", tiempo_running_acumulado);
 
     pinMode(PIN_SENSOR, INPUT);          
     pinMode(LED_PIN, OUTPUT);
@@ -119,6 +135,7 @@ void setup() {
 
     if (pubInterval <= 0) pubInterval = defaultPubIntervalMs;
     lastPublishMillis = millis() - pubInterval;
+    last_run_calc_millis = millis();
 
     const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
     const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
@@ -199,22 +216,47 @@ void loop() {
         }
     }
 
-// 3. DETECTOR DE PARADA (Ajustado para máquinas lentas)
-unsigned long localLastPulse;
-noInterrupts();
-localLastPulse = lastPulseTime;
-interrupts();
+    // 3. DETECTOR DE PARADA (Ajustado para máquinas lentas)
+    unsigned long localLastPulse;
+    noInterrupts();
+    localLastPulse = lastPulseTime;
+    interrupts();
 
-// 10000000 us = 10 segundos. 
-// Como tu pulso llega cada 5s, esto da un margen de espera razonable.
-if (micros() - localLastPulse > 10000000) {  
-    if (maquina_running) { 
-        rpm = 0; 
-        pps = 0;
-        maquina_running = false;
-        Serial.println("[INFO] Máquina detenida (Tiempo de espera de 10s agotado).");
+    // 10000000 us = 10 segundos. 
+    // Como tu pulso llega cada 5s, esto da un margen de espera razonable.
+    if (micros() - localLastPulse > 10000000) {  
+        if (maquina_running) { 
+            rpm = 0; 
+            pps = 0;
+            maquina_running = false;
+            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 10s agotado).");
+        }
     }
-}
+
+    // --- NUEVO: LÓGICA DEL ACUMULADOR DE TIEMPO RUNNING ---
+    unsigned long current_millis = millis();
+    if (maquina_running) {
+        // Incrementar cada 1 segundo (1000 ms)
+        if (current_millis - last_run_calc_millis >= 1000) {
+            tiempo_running_acumulado++;
+            last_run_calc_millis = current_millis;
+
+            // Guardar en flash cada 15 segundos para proteger la vida útil de la memoria
+            if (tiempo_running_acumulado - ultimo_tiempo_guardado >= 15) {
+                preferences.putUInt("run_time", tiempo_running_acumulado);
+                ultimo_tiempo_guardado = tiempo_running_acumulado;
+            }
+        }
+    } else {
+        last_run_calc_millis = current_millis; // Mantener sincronizado mientras está apagada
+        
+        // Si la máquina se detiene y hay segundos que no se han guardado en flash, guárdalos ahora
+        if (tiempo_running_acumulado != ultimo_tiempo_guardado) {
+            preferences.putUInt("run_time", tiempo_running_acumulado);
+            ultimo_tiempo_guardado = tiempo_running_acumulado;
+            Serial.println("[NVS] Tiempo guardado al detenerse la máquina.");
+        }
+    }
 
     // 4. PUBLICACIÓN PERIÓDICA (Aquí ocurre el parpadeo)
     if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
