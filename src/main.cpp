@@ -14,7 +14,7 @@ uint8_t temprature_sens_read();
 
 // --- VARIABLES PARA EL CONTROL DE REINICIO AUTOMÁTICO ---
 unsigned long wifiDownMillis = 0;       
-const unsigned long RESTART_TIMEOUT = 10000; 
+const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline antes de reiniciar
 
 String user_html = "";  
 char* ssid_pfix = (char*)"IOT_DEVICE";
@@ -121,7 +121,7 @@ void setup() {
     ultimo_tiempo_guardado = tiempo_running_acumulado;
     Serial.printf("[NVS] Tiempo running acumulado recuperado: %u segundos\n", tiempo_running_acumulado);
 
-    pinMode(PIN_SENSOR, INPUT);          
+    pinMode(PIN_SENSOR, INPUT); // <-- REGRESADO A INPUT PORQUE YA HAY PULLDOWN FÍSICO
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW); 
 
@@ -192,6 +192,15 @@ void loop() {
 
         if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
             Serial.println("[ALERTA] Reiniciando por falta de red...");
+            
+            // --- NUEVO: RESPALDO DE EMERGENCIA ANTES DE REINICIAR ---
+            if (tiempo_running_acumulado != ultimo_tiempo_guardado) {
+                preferences.putUInt("run_time", tiempo_running_acumulado);
+                ultimo_tiempo_guardado = tiempo_running_acumulado;
+                Serial.println("[NVS] Guardado de emergencia completado.");
+            }
+            // --------------------------------------------------------
+
             delay(1000);
             ESP.restart();
         }
