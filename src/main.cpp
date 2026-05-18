@@ -231,14 +231,14 @@ void loop() {
     localLastPulse = lastPulseTime;
     interrupts();
 
-    // 10000000 us = 10 segundos. 
+    // 15000000 us = 15 segundos. 
     // Como tu pulso llega cada 5s, esto da un margen de espera razonable.
-    if (micros() - localLastPulse > 10000000) {  
+    if (micros() - localLastPulse > 15000000) {  
         if (maquina_running) { 
             rpm = 0; 
             pps = 0;
             maquina_running = false;
-            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 10s agotado).");
+            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 15s agotado).");
         }
     }
 
