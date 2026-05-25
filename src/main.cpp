@@ -1,274 +1,187 @@
 #include <Arduino.h>
-#include <WiFi.h>      
-#include <IO7F32.h>    
-#include <Preferences.h> // --- Librería para guardar en memoria flash ---
+#include <IO7F32.h>      // Librería específica para ESP32
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 
-// --- Declaración para el sensor de temperatura interno ---
-#ifdef __cplusplus
-extern "C" {
-#endif
-uint8_t temprature_sens_read();
-#ifdef __cplusplus
-}
-#endif
+// Instancia del ADC externo
+Adafruit_ADS1115 ads;
 
-// --- VARIABLES PARA EL CONTROL DE REINICIO AUTOMÁTICO ---
-unsigned long wifiDownMillis = 0;       
-const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline antes de reiniciar
+// ====== VARIABLES DE CALIBRACIÓN Y FILTRADO ======
+// Ajustada matemáticamente para corregir la sutil saturación del núcleo de ferrita.
+// Relación validada en pruebas: (15.4A del Tester / 14.73A del Monitor anterior) * 50 = 52.27
+const float FACTOR_CALIBRADO = 52.27; 
 
-String user_html = "";  
+// Variables globales para el manejo dinámico de la escala (Autorango por Software)
+adsGain_t gananciaActual = GAIN_TWO;
+float rangoVoltajeActual = 2.048;
+float corrienteRMS = 0.0;
+float voltajeRMS = 0.0;
+
+// Variable obligatoria para la interfaz de la librería IO7F32
+String user_html = "";
+
+// Nombre del punto de acceso para configuración local si falla el WiFi
 char* ssid_pfix = (char*)"IOT_DEVICE";
 
-unsigned long lastPublishMillis = 0;
-int defaultPubIntervalMs = 5000;
+// Control de tiempo para publicación (envío inmediato al conectar)
+unsigned long lastPublishMillis = -pubInterval;
 
-float limite_rpm = 75;  
-int pulsesPerRev = 1;      
-const int PIN_SENSOR = 18; 
-const int LED_PIN = 2;
-unsigned long debounceUs; 
-
-volatile bool newData = false;
-volatile unsigned long lastPulseTime = 0;
-volatile unsigned long pulsePeriodUs = 0; 
-
-float pps = 0;
-float rpm = 0;
-bool maquina_running = false; 
-
-uint32_t reconnecciones_wifi = 0;   
-bool wifiWasConnected = false;      
-
-// --- VARIABLES PARA EL ACUMULADOR DE TIEMPO EN FLASH ---
-Preferences preferences;
-uint32_t tiempo_running_acumulado = 0; // Tiempo total en segundos
-uint32_t ultimo_tiempo_guardado = 0;
-unsigned long last_run_calc_millis = 0;
-
-// ---------------------------------------------------------------------------
-// INTERRUPCIÓN (ISR)
-// ---------------------------------------------------------------------------
-IRAM_ATTR void onPulse() {
-    unsigned long now = micros();
-    unsigned long timeDifference = now - lastPulseTime;
-    if (timeDifference > debounceUs) {
-        pulsePeriodUs = timeDifference; 
-        lastPulseTime = now;
-        newData = true; 
+// Función para cambiar la escala del PGA interno del ADS1115 por comandos
+void configurarEscala(int opcion) {
+    switch(opcion) {
+        case 1: // Escala Alta (Hasta 50A) -> Rango +-2.048V
+            gananciaActual = GAIN_TWO;
+            rangoVoltajeActual = 2.048;
+            break;
+        case 2: // Escala Media (Hasta ~25A) -> Rango +-1.024V
+            gananciaActual = GAIN_FOUR;
+            rangoVoltajeActual = 1.024;
+            break;
+        case 3: // Escala Baja (Hasta ~12A) -> Rango +-0.512V
+            gananciaActual = GAIN_EIGHT;
+            rangoVoltajeActual = 0.512;
+            break;
+        case 4: // Escala Milivoltios (Señales críticas) -> Rango +-0.256V
+            gananciaActual = GAIN_SIXTEEN;
+            rangoVoltajeActual = 0.256;
+            break;
+        default:
+            return;
     }
+    ads.setGain(gananciaActual);
+    Serial.printf("[ADS1115] Escala cambiada por comando a opción: %d (Rango: +-%fV)\n", opcion, rangoVoltajeActual);
 }
 
-// ---------------------------------------------------------------------------
-// HANDLERS IO7
-// ---------------------------------------------------------------------------
-void handleUserMeta() {
-    if (cfg["meta"].containsKey("pubInterval")) {
-        pubInterval = cfg["meta"]["pubInterval"].as<int>();
-        if (pubInterval < 200) pubInterval = 200;
-    }
-}
-
-void handleUserCommand(char* topic, JsonDocument* root) {}
-
-// ---------------------------------------------------------------------------
-// PUBLICACIÓN DE DATOS MQTT
-// ---------------------------------------------------------------------------
 void publishData() {
-    StaticJsonDocument<768> root; 
-    JsonObject data = root.createNestedObject("d");
+    float sumaCuadrados = 0.0; 
+    int muestras = 400; // 400 muestras consecutivas rápidas cubren de sobra los ciclos a 60Hz
+    int contador = 0;
 
-    float temp_c = (temprature_sens_read() - 32) / 1.8;
+    // 1. Muestreo de hardware de alta velocidad del canal diferencial (A0 - A1)
+    while(contador < muestras) {
+        int16_t resultadoRaw = ads.readADC_Differential_0_1(); 
+        
+        // Convertir el valor binario a Voltaje real según la escala activa
+        float voltaje = resultadoRaw * (rangoVoltajeActual / 32768.0);
+        
+        // Acumular los cuadrados de los voltajes en una variable flotante
+        sumaCuadrados += (voltaje * voltaje);
+        contador++;
+    }
 
-    data["pps"] = round(pps * 100.0) / 100.0;
-    data["rpm"] = round(rpm * 100.0) / 100.0;
-    data["running"] = maquina_running ? 1 : 0;
-    data["temp"] = round(temp_c * 10.0) / 10.0; 
-    data["uptime"] = millis() / 1000;          
-    data["reconn"] = reconnecciones_wifi;     
-    data["heap"]   = ESP.getFreeHeap();       
-    data["d18_logic"] = digitalRead(PIN_SENSOR);
-    data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
-    data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
-    data["status"] = "Online";
+    // 2. Procesamiento matemático del Voltaje RMS
+    voltajeRMS = sqrt(sumaCuadrados / (float)muestras);
     
-    // --- Publicar el tiempo acumulado de running (en segundos) ---
-    data["run_time_sec"] = tiempo_running_acumulado;
+    // 3. Conversión a Corriente Real usando tu factor calibrado
+    corrienteRMS = voltajeRMS * FACTOR_CALIBRADO;
+
+    // 4. UMBRAL DE CERO (Noise Gate):
+    // Si la lectura está por debajo de 0.25 Amperios, forzamos un cero limpio en la plataforma
+    if (corrienteRMS < 0.25) {
+        corrienteRMS = 0.00;
+    }
+
+    // Mostrar medición en local antes de transmitir por red
+    Serial.print("[MEDICIÓN] Voltaje: ");
+    Serial.print(voltajeRMS, 4);
+    Serial.print(" V RMS | Corriente: ");
+    Serial.print(corrienteRMS, 2);
+    Serial.println(" A");
+
+    // 5. Empaquetar y enviar datos estructurados JSON por MQTT
+    StaticJsonDocument<512> root;
+    JsonObject data = root.createNestedObject("d");
+    
+    // --- PAYLOAD ENVIADO AL DASHBOARD ---
+    data["status"] = "running";
+    data["corriente"] = serialized(String(corrienteRMS, 2)); // Forzar transmisión redondeada a 2 decimales
+    data["voltaje_sensor"] = serialized(String(voltajeRMS, 4));
+    data["escala_v"] = rangoVoltajeActual;
+    // ------------------------------------
 
     serializeJson(root, msgBuffer);
-
-    if (WiFi.status() == WL_CONNECTED && client.connected()) {
-        if (client.publish(evtTopic, msgBuffer)) {
-            // INDICADOR VISUAL: Solo parpadea si se envió correctamente
-            digitalWrite(LED_PIN, HIGH);
-            delay(50); // 50ms es ideal para ver el parpadeo
-            digitalWrite(LED_PIN, LOW);
-            Serial.printf("TX OK | RPM: %.2f | Temp ESP: %.1f C | Run Time: %u s\n", rpm, temp_c, tiempo_running_acumulado);
-        }
+    
+    if (client.publish(evtTopic, msgBuffer)) {
+        Serial.println("[MQTT] Evento de telemetría enviado a IO7 OK");
+    } else {
+        Serial.println("[MQTT] Error al enviar paquete a IO7");
     }
 }
 
-// ---------------------------------------------------------------------------
-// SETUP
-// ---------------------------------------------------------------------------
+void handleUserMeta() {
+    // Sincroniza el intervalo de publicación desde la plataforma
+    if (cfg["meta"].containsKey("pubInterval")) {
+        pubInterval = cfg["meta"]["pubInterval"].as<int>();
+        Serial.printf("Intervalo actualizado: %d ms\n", pubInterval);
+    }
+}
+
+void handleUserCommand(char* topic, JsonDocument* root) {
+    // --- LÓGICA DE COMANDOS: CAMBIO DE ESCALA DESDE EL DASHBOARD ---
+    // Estructura del JSON esperada desde el widget/botón web: {"d": {"escala": X}} (Donde X va de 1 a 4)
+    JsonObject d = (*root)["d"];
+    if (d.containsKey("escala")) {
+        int nuevaEscala = d["escala"].as<int>();
+        configurarEscala(nuevaEscala);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
-    delay(300);
-    Serial.println("\n[BOOT] Iniciando sistema de monitoreo...");
 
-    // --- INICIALIZAR MEMORIA FLASH Y RECUPERAR ACUMULADO ---
-    preferences.begin("estado_maq", false);
-    tiempo_running_acumulado = preferences.getUInt("run_time", 0);
-    ultimo_tiempo_guardado = tiempo_running_acumulado;
-    Serial.printf("[NVS] Tiempo running acumulado recuperado: %u segundos\n", tiempo_running_acumulado);
+    // Inicializar I2C en los pines nativos del ESP32 DevKit V1 (SDA=21, SCL=22)
+    Wire.begin(18, 19); 
 
-    pinMode(PIN_SENSOR, INPUT); // <-- REGRESADO A INPUT PORQUE YA HAY PULLDOWN FÍSICO
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW); 
+    // Inicializar el módulo ADC externo
+    if (!ads.begin()) {
+        Serial.println("¡ALERTA: No se detectó el módulo ADS1115 en los pines D21 y D22!");
+        // No bloqueamos con un while(1) aquí para permitir que la librería IO7 levante su Access Point de respaldo si es necesario
+    } else {
+        Serial.println("[ADS1115] Inicializado correctamente en pines de hardware.");
+        ads.setDataRate(RATE_ADS1115_860SPS); // Forzar máxima velocidad de muestreo
+        configurarEscala(1);                  // Arrancar siempre en la escala más protegida (+-2.048V)
+    }
 
-    debounceUs = (60000000 / (limite_rpm * 1.2)) / pulsesPerRev;
-    attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), onPulse, RISING);
-
+    // Inicialización del dispositivo y carga del sistema de archivos interno (LittleFS)
     initDevice();
+
+    // Registro de funciones Callback (Meta y Comandos)
     userMeta = handleUserMeta;
     userCommand = handleUserCommand;
+
+    // Aplicar configuración inicial de la plataforma
     handleUserMeta();
 
-    if (pubInterval <= 0) pubInterval = defaultPubIntervalMs;
-    lastPublishMillis = millis() - pubInterval;
-    last_run_calc_millis = millis();
+    // Asegura un intervalo por defecto si no existe configuración previa
+    if (pubInterval <= 0) pubInterval = 5000;
 
-    const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
-    const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
-
+    // Conexión WiFi en modo Estación utilizando las credenciales cargadas de memoria
     WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, pass);
+    WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
     
-    Serial.print("Conectando a WiFi...");
-    int timeout = 0;
-    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+    Serial.print("Conectando WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
-        timeout++;
     }
+    
+    Serial.printf("\nConectado de forma exitosa | IP Asignada: %s\n", WiFi.localIP().toString().c_str());
 
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WIFI] ¡Conectado con éxito!");
-        wifiWasConnected = true;
-    } else {
-        Serial.println("\n[WIFI] No se pudo conectar al inicio.");
-        wifiWasConnected = false;
-        wifiDownMillis = millis(); 
-    }
+    // Configuración de credenciales de red y conexión inicial al broker MQTT
+    set_iot_server();
+    iot_connect();
 }
 
-// ---------------------------------------------------------------------------
-// LOOP PRINCIPAL
-// ---------------------------------------------------------------------------
 void loop() {
-    // 1. GESTIÓN DE CONEXIÓN
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!wifiWasConnected) {
-            wifiWasConnected = true;
-            wifiDownMillis = 0; 
-            Serial.println("[WIFI] Reconectado.");
-        }
-
-        if (!client.connected()) {
-            static uint32_t lastTry = 0;
-            if (millis() - lastTry > 5000) {
-                iot_connect();
-                lastTry = millis();
-            }
-        }
-        client.loop();
-    } 
-    else {
-        if (wifiWasConnected) {
-            reconnecciones_wifi++; 
-            wifiWasConnected = false;
-            wifiDownMillis = millis();
-            Serial.println("[WIFI] Conexión perdida...");
-        }
-
-        if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
-            Serial.println("[ALERTA] Reiniciando por falta de red...");
-            
-            // --- NUEVO: RESPALDO DE EMERGENCIA ANTES DE REINICIAR ---
-            if (tiempo_running_acumulado != ultimo_tiempo_guardado) {
-                preferences.putUInt("run_time", tiempo_running_acumulado);
-                ultimo_tiempo_guardado = tiempo_running_acumulado;
-                Serial.println("[NVS] Guardado de emergencia completado.");
-            }
-            // --------------------------------------------------------
-
-            delay(1000);
-            ESP.restart();
-        }
+    // Mantiene la conexión viva con el broker MQTT y reconecta automáticamente si cae el enlace
+    if (!client.connected()) {
+        iot_connect();
     }
+    
+    client.loop();
 
-    // 2. CÁLCULO DE VELOCIDAD
-    if (newData) {
-        noInterrupts();
-        unsigned long periodo = pulsePeriodUs; 
-        newData = false;
-        interrupts();
-
-        if (periodo > 0) {
-            float pps_temp = 1000000.0f / (float)periodo; 
-            float rpm_temp = (pps_temp * 60.0f / (float)pulsesPerRev);
-
-            if (rpm_temp < limite_rpm) {
-                pps = pps_temp;
-                rpm = rpm_temp;
-                maquina_running = true; 
-            }
-        }
-    }
-
-    // 3. DETECTOR DE PARADA (Ajustado para máquinas lentas)
-    unsigned long localLastPulse;
-    noInterrupts();
-    localLastPulse = lastPulseTime;
-    interrupts();
-
-    // 15000000 us = 15 segundos. 
-    // Como tu pulso llega cada 5s, esto da un margen de espera razonable.
-    if (micros() - localLastPulse > 15000000) {  
-        if (maquina_running) { 
-            rpm = 0; 
-            pps = 0;
-            maquina_running = false;
-            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 15s agotado).");
-        }
-    }
-
-    // --- NUEVO: LÓGICA DEL ACUMULADOR DE TIEMPO RUNNING ---
-    unsigned long current_millis = millis();
-    if (maquina_running) {
-        // Incrementar cada 1 segundo (1000 ms)
-        if (current_millis - last_run_calc_millis >= 1000) {
-            tiempo_running_acumulado++;
-            last_run_calc_millis = current_millis;
-
-            // Guardar en flash cada 15 segundos para proteger la vida útil de la memoria
-            if (tiempo_running_acumulado - ultimo_tiempo_guardado >= 15) {
-                preferences.putUInt("run_time", tiempo_running_acumulado);
-                ultimo_tiempo_guardado = tiempo_running_acumulado;
-            }
-        }
-    } else {
-        last_run_calc_millis = current_millis; // Mantener sincronizado mientras está apagada
-        
-        // Si la máquina se detiene y hay segundos que no se han guardado en flash, guárdalos ahora
-        if (tiempo_running_acumulado != ultimo_tiempo_guardado) {
-            preferences.putUInt("run_time", tiempo_running_acumulado);
-            ultimo_tiempo_guardado = tiempo_running_acumulado;
-            Serial.println("[NVS] Tiempo guardado al detenerse la máquina.");
-        }
-    }
-
-    // 4. PUBLICACIÓN PERIÓDICA (Aquí ocurre el parpadeo)
-    if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
+    // Temporizador de publicación asíncrono basado en pubInterval
+    if ((pubInterval != 0) && (millis() - lastPublishMillis > (unsigned long)pubInterval)) {
         publishData();
         lastPublishMillis = millis();
     }
