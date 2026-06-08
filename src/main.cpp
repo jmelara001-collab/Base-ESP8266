@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>      
 #include <IO7F32.h>    
-#include <Preferences.h> // --- Librería para guardar en memoria flash ---
 
 // --- Declaración para el sensor de temperatura interno ---
 #ifdef __cplusplus
@@ -16,50 +15,21 @@ uint8_t temprature_sens_read();
 unsigned long wifiDownMillis = 0;       
 const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline antes de reiniciar
 
-String user_html = "";  
-char* ssid_pfix = (char*)"IOT_DEVICE";
+// --- VARIABLES DE CONFIGURACIÓN DE USUARIO ---
+String user_html = "<p><input type='text' name='meta.yourVar' placeholder='Your Custom Config'>";
+int customVar1;
+char* ssid_pfix = (char*)"IOT_DEVICE"; // Nombre del WiFi mantenido
 
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
 
-float limite_rpm = 60;  
-int pulsesPerRev = 1;      
-const int PIN_SENSOR = 18; 
+// --- VARIABLES DEL RELÉ ---
+const int RELAY = 18;
 const int LED_PIN = 2;
-unsigned long debounceUs; 
-
-volatile bool newData = false;
-volatile unsigned long lastPulseTime = 0;
-volatile unsigned long pulsePeriodUs = 0; 
-
-float pps = 0;
-float rpm = 0;
-bool maquina_running = false; 
+bool relay_estado = false; // Indica si el relé está activado
 
 uint32_t reconnecciones_wifi = 0;   
 bool wifiWasConnected = false;      
-
-// --- VARIABLES PARA EL ACUMULADOR DE TIEMPO EN FLASH CORREGIDO ---
-Preferences preferences;
-uint32_t tiempo_acumulado_historial = 0;  // Total acumulado en encendidos anteriores (NVS)
-uint32_t tiempo_running_ciclo_actual = 0; // Segundos trabajados DESDE este arranque
-uint32_t tiempo_running_total = 0;        // La SUMA de ambos (lo que se envía y guarda)
-
-uint32_t ultimo_tiempo_guardado = 0;
-unsigned long last_run_calc_millis = 0;
-
-// ---------------------------------------------------------------------------
-// INTERRUPCIÓN (ISR)
-// ---------------------------------------------------------------------------
-IRAM_ATTR void onPulse() {
-    unsigned long now = micros();
-    unsigned long timeDifference = now - lastPulseTime;
-    if (timeDifference > debounceUs) {
-        pulsePeriodUs = timeDifference; 
-        lastPulseTime = now;
-        newData = true; 
-    }
-}
 
 // ---------------------------------------------------------------------------
 // HANDLERS IO7
@@ -69,43 +39,56 @@ void handleUserMeta() {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
         if (pubInterval < 200) pubInterval = 200;
     }
+    if (cfg["meta"].containsKey("yourVar")) {
+        customVar1 = cfg["meta"]["yourVar"];
+    }
 }
 
-void handleUserCommand(char* topic, JsonDocument* root) {}
+void handleUserCommand(char* topic, JsonDocument* root) {
+    JsonObject d = (*root)["d"];
+
+    // Si entra un comando para la válvula/relé
+    if (d.containsKey("valve")) {
+        if (strstr(d["valve"], "on")) {
+            digitalWrite(RELAY, HIGH);
+            relay_estado = true;
+        } else {
+            digitalWrite(RELAY, LOW);
+            relay_estado = false;
+        }
+        // Forzar publicación inmediata al cambiar de estado para mayor respuesta
+        lastPublishMillis = millis() - pubInterval; 
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PUBLICACIÓN DE DATOS MQTT
 // ---------------------------------------------------------------------------
 void publishData() {
-    StaticJsonDocument<768> root; 
+    StaticJsonDocument<512> root; 
     JsonObject data = root.createNestedObject("d");
 
     float temp_c = (temprature_sens_read() - 32) / 1.8;
 
-    data["pps"] = round(pps * 100.0) / 100.0;
-    data["rpm"] = round(rpm * 100.0) / 100.0;
-    data["running"] = maquina_running ? 1 : 0;
+    data["valve"] = relay_estado ? "on" : "off";
     data["temp"] = round(temp_c * 10.0) / 10.0; 
-    data["uptime"] = millis() / 1000;          
+    data["uptime"] = millis() / 1000; // Tiempo que lleva encendido el ESP         
     data["reconn"] = reconnecciones_wifi;     
     data["heap"]   = ESP.getFreeHeap();       
-    data["d18_logic"] = digitalRead(PIN_SENSOR);
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
-    
-    // --- Publicar el tiempo acumulado total real ---
-    data["run_time_sec"] = tiempo_running_total;
 
     serializeJson(root, msgBuffer);
 
     if (WiFi.status() == WL_CONNECTED && client.connected()) {
         if (client.publish(evtTopic, msgBuffer)) {
-            // INDICADOR VISUAL: Solo parpadea si se envió correctamente
+            // INDICADOR VISUAL: Parpadea si se envió correctamente
             digitalWrite(LED_PIN, HIGH);
-            delay(50); // 50ms es ideal para ver el parpadeo
+            delay(50); 
             digitalWrite(LED_PIN, LOW);
-            Serial.printf("TX OK | RPM: %.2f | Temp ESP: %.1f C | Run Time Total: %u s\n", rpm, temp_c, tiempo_running_total);
+            Serial.printf("TX OK | Relé: %s | Temp ESP: %.1f C | Uptime: %u s\n", 
+                          relay_estado ? "ON" : "OFF", temp_c, millis() / 1000);
         }
     }
 }
@@ -116,23 +99,12 @@ void publishData() {
 void setup() {
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n[BOOT] Iniciando sistema de monitoreo...");
+    Serial.println("\n[BOOT] Iniciando sistema de control de relé...");
 
-    // --- INICIALIZAR MEMORIA FLASH Y RECUPERAR HISTORIAL INAMOVIBLE ---
-    preferences.begin("estado_maq", false);
-    tiempo_acumulado_historial = preferences.getUInt("run_time", 0);
-    
-    // Al arrancar, el total es igual al historial recuperado
-    tiempo_running_total = tiempo_acumulado_historial;
-    ultimo_tiempo_guardado = tiempo_acumulado_historial;
-    Serial.printf("[NVS] Historial acumulado recuperado: %u segundos\n", tiempo_acumulado_historial);
-
-    pinMode(PIN_SENSOR, INPUT); 
+    pinMode(RELAY, OUTPUT);
+    digitalWrite(RELAY, LOW);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW); 
-
-    debounceUs = (60000000 / (limite_rpm * 1.2)) / pulsesPerRev;
-    attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), onPulse, RISING);
 
     initDevice();
     userMeta = handleUserMeta;
@@ -141,7 +113,6 @@ void setup() {
 
     if (pubInterval <= 0) pubInterval = defaultPubIntervalMs;
     lastPublishMillis = millis() - pubInterval;
-    last_run_calc_millis = millis();
 
     const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
     const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
@@ -198,89 +169,12 @@ void loop() {
 
         if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
             Serial.println("[ALERTA] Reiniciando por falta de red...");
-            
-            // --- RESPALDO DE EMERGENCIA ANTES DE REINICIAR (USANDO VARIABLE TOTAL) ---
-            if (tiempo_running_total != ultimo_tiempo_guardado) {
-                preferences.putUInt("run_time", tiempo_running_total);
-                ultimo_tiempo_guardado = tiempo_running_total;
-                Serial.println("[NVS] Guardado de emergencia completado.");
-            }
-            // -------------------------------------------------------------------------
-
             delay(1000);
             ESP.restart();
         }
     }
 
-    // 2. CÁLCULO DE VELOCIDAD
-    if (newData) {
-        noInterrupts();
-        unsigned long periodo = pulsePeriodUs; 
-        newData = false;
-        interrupts();
-
-        if (periodo > 0) {
-            float pps_temp = 1000000.0f / (float)periodo; 
-            float rpm_temp = (pps_temp * 60.0f / (float)pulsesPerRev);
-
-            if (rpm_temp < limite_rpm) {
-                pps = pps_temp;
-                rpm = rpm_temp;
-                maquina_running = true; 
-            }
-        }
-    }
-
-// 3. DETECTOR DE PARADA (Timeout de 20 segundos para bajas RPM)
-    unsigned long localLastPulse;
-    noInterrupts();
-    localLastPulse = lastPulseTime;
-    interrupts();
-
-    // 20,000,000 microsegundos = 20 segundos. 
-    // Ideal para soportar el ritmo de velocidades ultra bajas con un margen de seguridad.
-    if (micros() - localLastPulse > 20000000) {  
-        if (maquina_running) { 
-            noInterrupts(); // Protegemos la actualización de variables compartidas
-            rpm = 0; 
-            pps = 0;
-            interrupts();
-            
-            maquina_running = false;
-            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 20s agotado).");
-        }
-    }
-
-    // --- LÓGICA DEL ACUMULADOR DE TIEMPO RUNNING TOTAL PROTEGIDO ---
-    unsigned long current_millis = millis();
-    if (maquina_running) {
-        // Incrementar cada 1 segundo (1000 ms) el contador del ciclo actual
-        if (current_millis - last_run_calc_millis >= 1000) {
-            tiempo_running_ciclo_actual++;
-            last_run_calc_millis = current_millis;
-
-            // El TOTAL es la suma del historial inamovible + lo que va de este ciclo
-            tiempo_running_total = tiempo_acumulado_historial + tiempo_running_ciclo_actual;
-
-            // Guardar en flash cada 15 segundos de trabajo neto acumulado
-            if (tiempo_running_total - ultimo_tiempo_guardado >= 15) {
-                preferences.putUInt("run_time", tiempo_running_total);
-                ultimo_tiempo_guardado = tiempo_running_total;
-                Serial.printf("[NVS] Guardado periódico completado. Total: %u s\n", tiempo_running_total);
-            }
-        }
-    } else {
-        last_run_calc_millis = current_millis; // Mantener sincronizado mientras está apagada
-        
-        // Si la máquina se detiene y hay segundos que no se han guardado, los asegura
-        if (tiempo_running_total != ultimo_tiempo_guardado) {
-            preferences.putUInt("run_time", tiempo_running_total);
-            ultimo_tiempo_guardado = tiempo_running_total;
-            Serial.printf("[NVS] Guardado por parada de máquina. Total: %u s\n", tiempo_running_total);
-        }
-    }
-
-    // 4. PUBLICACIÓN PERIÓDICA
+    // 2. PUBLICACIÓN PERIÓDICA
     if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
         publishData();
         lastPublishMillis = millis();
