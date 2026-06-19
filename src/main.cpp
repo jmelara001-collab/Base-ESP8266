@@ -1,182 +1,123 @@
 #include <Arduino.h>
-#include <WiFi.h>      
-#include <IO7F32.h>    
+#include <ESP8266WiFi.h>
+#include <espnow.h>
 
-// --- Declaración para el sensor de temperatura interno ---
-#ifdef __cplusplus
-extern "C" {
-#endif
-uint8_t temprature_sens_read();
-#ifdef __cplusplus
+// DIRECCIONES MAC REALES DE TUS DOS RECEPTORES
+uint8_t macBomba[]   = {0x84, 0xCC, 0xA8, 0xA6, 0xFF, 0x8F};
+uint8_t macLampara[] = {0x84, 0x0D, 0x8E, 0xAF, 0x50, 0x23};
+
+// =========================================================================
+// ⚠️ PARÁMETROS CONFIGURADOS:
+// =========================================================================
+const float LIMITE_VOLTAJE = 0.90;           // Límite fijado en 0.9V
+const unsigned long TIEMPO_ESPERA = 300000;   // 5 minuto en milisegundos (300,000 ms)
+// =========================================================================
+
+typedef struct struct_message {
+    bool activarBomba;   // true = Orden de activar relé, false = Orden de apagar relé
+    bool activarLampara; // true = Orden de activar relé, false = Orden de apagar relé
+} struct_message;
+
+struct_message miData;
+
+unsigned long tiempoInicioBajo = 0;
+bool bajoLimiteAnterior = false;
+bool disparoRealizado = false; // Nueva bandera para asegurar un ÚNICO pulso de corte
+
+void OnDataSent(uint8_t *mac_addr, uint8_t sendStatus) {
+  Serial.print(" -> Enviado a [");
+  for (int i = 0; i < 6; i++) {
+    Serial.print(mac_addr[i], HEX);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println(sendStatus == 0 ? "]: ÉXITO" : "]: FALLO");
 }
-#endif
-
-// --- VARIABLES PARA EL CONTROL DE REINICIO AUTOMÁTICO ---
-unsigned long wifiDownMillis = 0;       
-const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline antes de reiniciar
-
-// --- VARIABLES DE CONFIGURACIÓN DE USUARIO ---
-String user_html = "<p><input type='text' name='meta.yourVar' placeholder='Your Custom Config'>";
-int customVar1;
-char* ssid_pfix = (char*)"IOT_DEVICE"; // Nombre del WiFi mantenido
-
-unsigned long lastPublishMillis = 0;
-int defaultPubIntervalMs = 5000;
-
-// --- VARIABLES DEL RELÉ ---
-const int RELAY = 18;
-const int LED_PIN = 2;
-bool relay_estado = false; // Indica si el relé está activado
-
-uint32_t reconnecciones_wifi = 0;   
-bool wifiWasConnected = false;      
-
-// ---------------------------------------------------------------------------
-// HANDLERS IO7
-// ---------------------------------------------------------------------------
-void handleUserMeta() {
-    if (cfg["meta"].containsKey("pubInterval")) {
-        pubInterval = cfg["meta"]["pubInterval"].as<int>();
-        if (pubInterval < 200) pubInterval = 200;
-    }
-    if (cfg["meta"].containsKey("yourVar")) {
-        customVar1 = cfg["meta"]["yourVar"];
-    }
-}
-
-void handleUserCommand(char* topic, JsonDocument* root) {
-    JsonObject d = (*root)["d"];
-
-    // Si entra un comando para la válvula/relé
-    if (d.containsKey("valve")) {
-        if (strstr(d["valve"], "on")) {
-            digitalWrite(RELAY, HIGH);
-            relay_estado = true;
-        } else {
-            digitalWrite(RELAY, LOW);
-            relay_estado = false;
-        }
-        // Forzar publicación inmediata al cambiar de estado para mayor respuesta
-        lastPublishMillis = millis() - pubInterval; 
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PUBLICACIÓN DE DATOS MQTT
-// ---------------------------------------------------------------------------
-void publishData() {
-    StaticJsonDocument<512> root; 
-    JsonObject data = root.createNestedObject("d");
-
-    float temp_c = (temprature_sens_read() - 32) / 1.8;
-
-    data["valve"] = relay_estado ? "on" : "off";
-    data["temp"] = round(temp_c * 10.0) / 10.0; 
-    data["uptime"] = millis() / 1000; // Tiempo que lleva encendido el ESP         
-    data["reconn"] = reconnecciones_wifi;     
-    data["heap"]   = ESP.getFreeHeap();       
-    data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
-    data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
-    data["status"] = "Online";
-
-    serializeJson(root, msgBuffer);
-
-    if (WiFi.status() == WL_CONNECTED && client.connected()) {
-        if (client.publish(evtTopic, msgBuffer)) {
-            // INDICADOR VISUAL: Parpadea si se envió correctamente
-            digitalWrite(LED_PIN, HIGH);
-            delay(50); 
-            digitalWrite(LED_PIN, LOW);
-            Serial.printf("TX OK | Relé: %s | Temp ESP: %.1f C | Uptime: %u s\n", 
-                          relay_estado ? "ON" : "OFF", temp_c, millis() / 1000);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SETUP
-// ---------------------------------------------------------------------------
+ 
 void setup() {
-    Serial.begin(115200);
-    delay(300);
-    Serial.println("\n[BOOT] Iniciando sistema de control de relé...");
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n--- EMISOR DE PROTECCIÓN POR PULSO INICIADO ---");
 
-    pinMode(RELAY, OUTPUT);
-    digitalWrite(RELAY, LOW);
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW); 
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
 
-    initDevice();
-    userMeta = handleUserMeta;
-    userCommand = handleUserCommand;
-    handleUserMeta();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
 
-    if (pubInterval <= 0) pubInterval = defaultPubIntervalMs;
-    lastPublishMillis = millis() - pubInterval;
+  if (esp_now_init() != 0) {
+    Serial.println("Error inicializando ESP-NOW");
+    return;
+  }
 
-    const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
-    const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, pass);
-    
-    Serial.print("Conectando a WiFi...");
-    int timeout = 0;
-    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
-        delay(500);
-        Serial.print(".");
-        timeout++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WIFI] ¡Conectado con éxito!");
-        wifiWasConnected = true;
-    } else {
-        Serial.println("\n[WIFI] No se pudo conectar al inicio.");
-        wifiWasConnected = false;
-        wifiDownMillis = millis(); 
-    }
+  esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+  esp_now_register_send_cb(OnDataSent);
+  
+  esp_now_add_peer(macBomba, ESP_NOW_ROLE_SLAVE, 1, NULL, 0);
+  esp_now_add_peer(macLampara, ESP_NOW_ROLE_SLAVE, 1, NULL, 0);
 }
-
-// ---------------------------------------------------------------------------
-// LOOP PRINCIPAL
-// ---------------------------------------------------------------------------
+ 
 void loop() {
-    // 1. GESTIÓN DE CONEXIÓN
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!wifiWasConnected) {
-            wifiWasConnected = true;
-            wifiDownMillis = 0; 
-            Serial.println("[WIFI] Reconectado.");
-        }
+  int lecturaRaw = analogRead(A0);
+  float voltaje = ((float)lecturaRaw * 3.3) / 1023.0;
 
-        if (!client.connected()) {
-            static uint32_t lastTry = 0;
-            if (millis() - lastTry > 5000) {
-                iot_connect();
-                lastTry = millis();
-            }
-        }
-        client.loop();
-    } 
-    else {
-        if (wifiWasConnected) {
-            reconnecciones_wifi++; 
-            wifiWasConnected = false;
-            wifiDownMillis = millis();
-            Serial.println("[WIFI] Conexión perdida...");
-        }
+  Serial.print("\nVoltaje A0: ");
+  Serial.print(voltaje);
+  Serial.print(" V");
 
-        if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
-            Serial.println("[ALERTA] Reiniciando por falta de red...");
-            delay(1000);
-            ESP.restart();
+  // EVALUAMOS SI EL VOLTAJE CAE POR DEBAJO DE 0.9V
+  if (voltaje < LIMITE_VOLTAJE) {
+    
+    // ETAPA 1: La lámpara se enciende INMEDIATAMENTE y se mantiene encendida
+    miData.activarLampara = true; 
+    Serial.print(" -> [ALARMA: LÁMPARA ENCENDIDA]");
+
+    // ETAPA 2: Control del temporizador de falla para la bomba
+    if (!bajoLimiteAnterior) {
+      tiempoInicioBajo = millis();
+      bajoLimiteAnterior = true;
+      disparoRealizado = false;    // Reseteamos el disparo para este nuevo ciclo de falla
+      miData.activarBomba = false; // Relé de bomba apagado al inicio de la falla
+      Serial.print(" Iniciando conteo de 1 min para el corte...");
+    } else {
+      unsigned long tiempoTranscurrido = millis() - tiempoInicioBajo;
+      Serial.print(" Tiempo Falla: ");
+      Serial.print(tiempoTranscurrido / 1000);
+      Serial.print("s / 60s");
+      
+      if (tiempoTranscurrido >= TIEMPO_ESPERA) {
+        if (!disparoRealizado) {
+          // --- ¡MOMENTO DEL DISPARO DEL PULSO! ---
+          miData.activarBomba = true;  // Envía el pulso de corte (Relé receptor va a LOW)
+          disparoRealizado = true;     // Marcamos que ya se ejecutó el pulso
+          Serial.print(" -> [¡PULSO DE CORTE ENVIADO!]");
+        } else {
+          // Si ya pasó el tiempo y ya se envió el pulso, dejamos de mandar la orden (vuelve a false)
+          miData.activarBomba = false; 
+          Serial.print(" -> [Corte completado. Esperando recuperación de flujo]");
         }
+      } else {
+        miData.activarBomba = false; // Sigue esperando a cumplir el minuto
+      }
     }
+  } 
+  else {
+    // ESTADO DE REPOSO O RECUPERACIÓN: Si el voltaje regresa a >= 0.9V, todo se normaliza
+    bajoLimiteAnterior = false;
+    disparoRealizado = false;
+    miData.activarBomba = false;   
+    miData.activarLampara = false; 
+    Serial.print(" -> Estado normal estable (Todo en reposo).");
+  }
 
-    // 2. PUBLICACIÓN PERIÓDICA
-    if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
-        publishData();
-        lastPublishMillis = millis();
-    }
+  // Testigo visual de envío y transmisión por radio
+  digitalWrite(LED_BUILTIN, LOW); 
+  esp_now_send(macBomba, (uint8_t *) &miData, sizeof(miData));
+  delay(10); 
+  esp_now_send(macLampara, (uint8_t *) &miData, sizeof(miData));
+  
+  delay(100);                      
+  digitalWrite(LED_BUILTIN, HIGH); 
+  
+  delay(1390); // Muestreo cada 1.5s aprox
 }
