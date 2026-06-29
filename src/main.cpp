@@ -1,19 +1,25 @@
 #include <Arduino.h>
 #include <IO7F8266.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 
-// =============================================================================
-// CONFIGURACIÓN DE LECTURA ANALÓGICA (A0)
-// =============================================================================
-#define ANALOG_PIN A0
+// Instanciar el ADC ADS1115
+Adafruit_ADS1115 ads;
 
-// Función para mapear valores con decimales (float)
-float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
-    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
+// Pines I2C asignados según el estándar del ESP-12E
+#define I2C_SDA 4  // GPIO4
+#define I2C_SCL 5  // GPIO5
 
-// =============================================================================
-// VARIABLES OBLIGATORIAS PARA LA LIBRERÍA IO7
-// =============================================================================
+// Relaciones de conversión de instrumentación
+const float FACTOR_DONA = 50.0; 
+const float FACTOR_TABLERO = 50.0; // <-- CAMBIADO: Ahora 5A medidos corresponden a 250A reales (250 / 5 = 50)
+
+// Variables globales para almacenar las lecturas procesadas
+float vRMS = 0.0;
+float corrienteAmperimetro = 0.0;
+float corrienteReal250A = 0.0;
+
+// Variable obligatoria para la librería IO7
 String user_html = "";
 
 // Prefijo para el nombre del AP de configuración
@@ -22,49 +28,57 @@ char* ssid_pfix = (char*)"IOT_Device";
 // Control de tiempo para publicación
 unsigned long lastPublishMillis = -pubInterval;
 
-// =============================================================================
-// FUNCIONES Y CALLBACKS
-// =============================================================================
+// Función dedicada a capturar los 200ms de onda senoidal de forma óptima
+float calcularVoltajeRMS() {
+    double sumaCuadrados = 0;
+    int numeroMuestras = 0;
+    unsigned long tiempoInicio = millis();
+    
+    while (millis() - tiempoInicio < 200) {
+        int16_t lecturaRaw = ads.readADC_Differential_2_3();
+        float voltajeInstantaneo = lecturaRaw * 0.000125;
+        sumaCuadrados += (voltajeInstantaneo * voltajeInstantaneo);
+        numeroMuestras++;
+    }
+    
+    if (numeroMuestras == 0) return 0.0;
+    return sqrt((float)(sumaCuadrados / numeroMuestras));
+}
 
 void publishData() {
-    // 1. Enciende el LED integrado (Lógica inversa: LOW = Encendido)
-    digitalWrite(LED_BUILTIN, LOW);
-
     StaticJsonDocument<512> root;
     JsonObject data = root.createNestedObject("d");
     
-    // Lectura del pin analógico A0 (0 a 1023)
-    int analogValue = analogRead(ANALOG_PIN);
+    // 1. Ejecutar la medición del ADC
+    vRMS = calcularVoltajeRMS();
     
-    // Conversión a voltaje (El ADC del ESP8266 NodeMCU mide de 0V a 3.3V internamente)
-    float voltaje = (analogValue * 3.3) / 1023.0;
-    
-    // Mapeo: 0.0V -> 0.0 m/min  |  3.3V -> 200.0 m/min
-    float velocidad = mapFloat(voltaje, 0.0, 3.3, 0.0, 200.0);
-    
-    // Control de seguridad por si hay un leve ruido en la lectura analógica
-    if (velocidad < 0.0) velocidad = 0.0;
-    if (velocidad > 200.0) velocidad = 200.0;
+    // Filtro para eliminar el ruido de fondo constante (4.5mV de offset)
+    if (vRMS <= 0.0046) {
+        vRMS = 0.0;
+    }
 
-    // Redondeo a 2 decimales para la trama JSON
-    velocidad = round(velocidad * 100.0) / 100.0;
-    voltaje = round(voltaje * 100.0) / 100.0;
+    // 2. Realizar los cálculos del mapeo lineal
+    corrienteAmperimetro = vRMS * FACTOR_DONA;
+    corrienteReal250A = corrienteAmperimetro * FACTOR_TABLERO; // Escala corregida a un máximo de 250A
+    
+    // 3. --- CONVERSIÓN ESTRICTA A 3 DECIMALES ---
+    String vRMS_str = String(vRMS, 3);
+    String iAmp_str = String(corrienteAmperimetro, 3);
+    String iReal_str = String(corrienteReal250A, 3);
 
-    // --- ESTRUCTURA DE DATOS ENVIADA ---
+    // 4. --- ENVIANDO DATOS EN FORMATO TEXTO SEGURO A IO7 ---
     data["status"] = "running";
-    data["voltaje"] = voltaje;
-    data["velocidad"] = velocidad; // Metros por minuto
-    // ----------------------------
+    data["voltaje_sensor"] = vRMS_str;  
+    data["i_amperimetro"] = iAmp_str;   
+    data["i_real"] = iReal_str;         // Cambiado dinámicamente para el nuevo límite de 250A
+    // -----------------------------------------------------
 
     serializeJson(root, msgBuffer);
     if (client.publish(evtTopic, msgBuffer)) {
-        Serial.printf("Evento enviado a IO7 OK | Voltaje: %.2fV | Vel: %.2f m/min\n", voltaje, velocidad);
+        Serial.println("Evento enviado a IO7 OK");
     } else {
         Serial.println("Error al enviar a IO7");
     }
-
-    // 2. Apaga el LED integrado tras el envío (Lógica inversa: HIGH = Apagado)
-    digitalWrite(LED_BUILTIN, HIGH);
 }
 
 void handleUserMeta() {
@@ -76,36 +90,40 @@ void handleUserMeta() {
 }
 
 void handleUserCommand(char* topic, JsonDocument* root) {
-    // --- LÓGICA DE COMANDOS AQUÍ ---
+    // --- LÓGICA DE COMANDOS AQUÍ SI ES NECESARIO ---
 }
-
-// =============================================================================
-// ARDUINO SETUP & LOOP
-// =============================================================================
 
 void setup() {
     Serial.begin(115200);
-    delay(500);
-    Serial.println("\n--- Iniciando Nodo de Monitoreo Velocidad (A0) + IO7 ---");
 
-    // Configurar el pin del LED integrado como salida y asegurar que inicie apagado (HIGH)
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, HIGH);
+    // Inicializar y acelerar el bus I2C a 400kHz para optimizar recursos del ESP8266
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000);
+
+    // Inicializar el ADS1115
+    if (!ads.begin()) {
+        Serial.println("¡Error Crítico! No se pudo encontrar el ADS1115.");
+        while (1);
+    }
+    
+    // Configurar los parámetros de alta velocidad del ADC
+    ads.setGain(GAIN_ONE);
+    ads.setDataRate(RATE_ADS1115_860SPS);
 
     // Inicialización del dispositivo IO7 y carga de configuración
     initDevice();
 
-    // Registro de funciones Callback de IO7
+    // Registro de funciones Callback
     userMeta = handleUserMeta;
     userCommand = handleUserCommand;
 
-    // Aplicar configuración inicial de metadatos
+    // Aplicar configuración inicial
     handleUserMeta();
 
-    // Intervalo de seguridad por defecto (5 segundos)
-    if (pubInterval <= 0) pubInterval = 5000;
+    // Cambiado explícitamente a 1000 ms (1 segundo) por defecto
+    if (pubInterval <= 0) pubInterval = 1000; 
 
-    // Conexión WiFi
+    // Conexión WiFi básica de la librería
     WiFi.mode(WIFI_STA);
     WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
     
@@ -123,16 +141,16 @@ void setup() {
 }
 
 void loop() {
-    // Mantener conexión MQTT activa con el Broker de IO7
+    // Mantener conexión MQTT activa
     if (!client.connected()) {
         iot_connect();
     }
     
     client.loop();
 
-    // Temporizador cíclico de publicación basado en el intervalo
+    // Temporizador de publicación basado en pubInterval
     if ((pubInterval != 0) && (millis() - lastPublishMillis > (unsigned long)pubInterval)) {
         publishData();
         lastPublishMillis = millis();
     }
-}   
+}
