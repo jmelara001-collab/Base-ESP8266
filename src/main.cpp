@@ -88,7 +88,7 @@ void publishData() {
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
-    data["id"] = "RCepilladora1";
+    data["id"] = "Cepilladora2";
     data["run_time_sec"] = tiempo_running_acumulado;
 
     serializeJson(root, msgBuffer);
