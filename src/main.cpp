@@ -20,8 +20,8 @@ char* ssid_pfix = (char*)"IOT_DEVICE";
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
 
-float limite_rpm = 80;  
-int pulsesPerRev = 12;      
+float limite_rpm = 70;  
+int pulsesPerRev = 4;      
 const int PIN_SENSOR = 18; 
 const int LED_PIN = 2;
 unsigned long debounceUs; 
@@ -88,7 +88,7 @@ void publishData() {
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
-    data["id"] = "Rameta";
+    data["id"] = "RCepilladora1";
     data["run_time_sec"] = tiempo_running_acumulado;
 
     serializeJson(root, msgBuffer);
