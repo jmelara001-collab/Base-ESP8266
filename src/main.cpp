@@ -20,8 +20,8 @@ char* ssid_pfix = (char*)"LAVADORA_IOT_DEVICE";
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
 
-float limite_rpm = 115;  
-int pulsesPerRev = 1;      
+float limite_rpm = 175;  
+int pulsesPerRev = 8;      
 const int PIN_SENSOR = 18; 
 const int LED_PIN = 2;
 unsigned long debounceUs; 
@@ -88,7 +88,7 @@ void publishData() {
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
-    data["id"] = "Lavadora";
+    data["id"] = "Rajadora3";
     data["run_time_sec"] = tiempo_running_acumulado;
 
     serializeJson(root, msgBuffer);
