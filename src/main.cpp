@@ -15,13 +15,13 @@ unsigned long wifiDownMillis = 0;
 const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline (WiFi o SSL) antes de reiniciar radio
 
 String user_html = "";  
-char* ssid_pfix = (char*)"LAVADORA_IOT_DEVICE";
+char* ssid_pfix = (char*)"IOT_DEVICE";
 
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
 
-float limite_rpm = 175;  
-int pulsesPerRev = 8;      
+float limite_rpm = 70;  
+int pulsesPerRev = 1;      
 const int PIN_SENSOR = 18; 
 const int LED_PIN = 2;
 unsigned long debounceUs; 
@@ -88,7 +88,7 @@ void publishData() {
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
-    data["id"] = "Rajadora3";
+    data["id"] = "Compactadora";
     data["run_time_sec"] = tiempo_running_acumulado;
 
     serializeJson(root, msgBuffer);
@@ -255,18 +255,18 @@ void loop() {
         }
     }
 
-    // 2. DETECTOR DE PARADA
+// 2. DETECTOR DE PARADA
     unsigned long localLastPulse;
     noInterrupts();
     localLastPulse = lastPulseTime;
     interrupts();
 
-    if (micros() - localLastPulse > 2000000) {  
+    if (micros() - localLastPulse > 8000000) {  
         if (maquina_running) { 
             rpm = 0; 
             pps = 0;
             maquina_running = false;
-            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 2s agotado).");
+            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 8s agotado).");
         }
     }
 
