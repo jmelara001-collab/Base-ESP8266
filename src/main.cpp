@@ -1,295 +1,205 @@
 #include <Arduino.h>
-#include <WiFi.h>      
-#include <IO7F32.h>    
-#include <Preferences.h> 
+#include <IO7F8266.h>
+#include <SoftwareSerial.h>
+#include <ModbusMaster.h>
 
-// --- PROTOTIPOS DE FUNCIONES (Para evitar errores de compilación en VS Code) ---
-void core0NetworkTask(void * pvParameters);
-void publishData();
-void handleUserMeta();
-void handleUserCommand(char* topic, JsonDocument* root);
-IRAM_ATTR void onPulse();
+// ==========================================
+// CONFIGURACIÓN PINOUT RS-485 / MODBUS
+// ==========================================
+#define RX_PIN 14    // D5 (GPIO14) -> RO del MAX485
+#define TX_PIN 12    // D6 (GPIO12) -> DI del MAX485
+#define DE_RE_PIN 4  // D2 (GPIO4)  -> DE y RE unidos
 
-// --- VARIABLES PARA EL CONTROL DE REINICIO AUTOMÁTICO ---
-unsigned long wifiDownMillis = 0;       
-const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline (WiFi o SSL) antes de reiniciar radio
+// Parámetros confirmados del Circutor Computer Smart III
+#define SMART3_SLAVE_ID 1
+#define SMART3_BAUDRATE 19200
 
-String user_html = "";  
-char* ssid_pfix = (char*)"IOT_DEVICE";
+SoftwareSerial rs485(RX_PIN, TX_PIN);
+ModbusMaster smart3Node;
 
-unsigned long lastPublishMillis = 0;
-int defaultPubIntervalMs = 5000;
+// Variables obligatorias para IO7F8266
+String user_html = "";
+char* ssid_pfix = (char*)"IOT_Device";
 
-float limite_rpm = 60;  
-int pulsesPerRev = 1;      
-const int PIN_SENSOR = 18; 
-const int LED_PIN = 2;
-unsigned long debounceUs; 
+// Control de tiempo para publicación
+unsigned long lastPublishMillis = -pubInterval;
 
-volatile bool newData = false;
-volatile unsigned long lastPulseTime = 0;
-volatile unsigned long pulsePeriodUs = 0; 
+// Control de dirección para el transceptor MAX485
+void preTransmission() {
+    digitalWrite(DE_RE_PIN, HIGH);
+    delayMicroseconds(200);
+}
 
-float pps = 0;
-float rpm = 0;
-bool maquina_running = false; 
+void postTransmission() {
+    delayMicroseconds(200);
+    digitalWrite(DE_RE_PIN, LOW);
+}
 
-uint32_t reconnecciones_wifi = 0;   
-bool wifiWasConnected = false;      
+// Unir dos registros de 16 bits (High y Low) a 32 bits según el estándar del Smart III
+uint32_t combineRegisters(uint16_t high, uint16_t low) {
+    return ((uint32_t)high << 16) | low;
+}
 
-// --- VARIABLES PARA EL ACUMULADOR DE TIEMPO EN FLASH ---
-Preferences preferences;
-uint32_t tiempo_running_acumulado = 0; 
-uint32_t ultimo_tiempo_guardado = 0;
-unsigned long last_run_calc_millis = 0;
+// ==========================================
+// FUNCIÓN DE PUBLICACIÓN A PLATAFORMA IO7
+// ==========================================
+void publishData() {
+    StaticJsonDocument<512> root;
+    JsonObject data = root.createNestedObject("d");
+    
+    // Variables temporales para almacenar lecturas
+    float kw_inst = 0;
+    float pf = 0;
+    float mwh = 0;
+    bool read_ok = true;
+    uint8_t err_code = 0;
 
-// --- TAREA PARA EL CORE 0 (RED) ---
-TaskHandle_t NetworkTaskHandle;
+    // --- LECTURA 1: Potencia Instantánea y Cos Phi (Pantalla Principal) ---
+    // Leemos 18 registros empezando en 0x0052 hasta 0x0063
+    uint8_t result1 = smart3Node.readInputRegisters(0x0052, 18);
 
-// ---------------------------------------------------------------------------
-// INTERRUPCIÓN (ISR) - Ejecuta instantáneamente ante un pulso físico
-// ---------------------------------------------------------------------------
-IRAM_ATTR void onPulse() {
-    unsigned long now = micros();
-    unsigned long timeDifference = now - lastPulseTime;
-    if (timeDifference > debounceUs) {
-        pulsePeriodUs = timeDifference; 
-        lastPulseTime = now;
-        newData = true; 
+    if (result1 == smart3Node.ku8MBSuccess) {
+        // Potencia Activa Instantánea (0x0052) -> Offset 0 y 1
+        uint32_t rawW = combineRegisters(smart3Node.getResponseBuffer(0), smart3Node.getResponseBuffer(1));
+        
+        // Cos Phi trifásico (0x0062) -> Offset 16 y 17 (0x62 - 0x52 = 0x10 = 16 decimal)
+        // Este es el valor que el Circutor muestra en su pantalla principal para la compensación
+        uint32_t rawCosPhi = combineRegisters(smart3Node.getResponseBuffer(16), smart3Node.getResponseBuffer(17));
+        
+        kw_inst = rawW / 1000.0;    // Convertir Vatios a Kilovatios
+        
+        // Autodetección de escala para el Cos Phi
+        if (rawCosPhi > 100) {
+            pf = rawCosPhi / 1000.0;    // Escala x1000 (Ej. 937 -> 0.94)
+        } else {
+            pf = rawCosPhi / 100.0;     // Escala x100 (Ej. 94 -> 0.94)
+        }
+        
+    } else {
+        read_ok = false;
+        err_code = result1;
+    }
+
+    // Pequeña pausa para no saturar el bus RS-485
+    delay(50);
+
+    // --- LECTURA 2: Energía Activa Consumida ---
+    // Leemos 2 registros desde 0x0088 (Energía activa consumida en kWh)
+    uint8_t result2 = smart3Node.readInputRegisters(0x0088, 2);
+
+    if (result2 == smart3Node.ku8MBSuccess) {
+        // Energía Acumulada (0x0088) -> Offset 0 y 1
+        uint32_t rawKWh = combineRegisters(smart3Node.getResponseBuffer(0), smart3Node.getResponseBuffer(1));
+        
+        // Conversión a Megavatios-hora (MWh) dividiendo entre 1000
+        mwh = rawKWh / 1000.0; 
+    } else {
+        read_ok = false;
+        err_code = result2; // Sobrescribe el error si la lectura 2 falla
+    }
+
+    // --- CONSTRUCCIÓN DEL JSON ---
+    if (read_ok) {
+        data["status"] = "ok";
+        
+        // Convertimos a texto con 2 decimales limpios
+        data["kw_inst"] = serialized(String(kw_inst, 2));
+        data["mwh"]     = serialized(String(mwh, 2));
+        data["pf"]      = serialized(String(pf, 2)); // Mandamos el Cos Phi bajo la etiqueta pf
+
+        Serial.printf("Smart III OK | kW Inst: %.2f kW | MWh Acumulado: %.2f MWh | Cos phi (Pantalla): %.2f\n", kw_inst, mwh, pf);
+    } else {
+        // Reportar error de bus Modbus a IO7
+        data["status"] = "modbus_error";
+        data["modbus_code"] = err_code;
+        data["kw_inst"] = 0;
+        data["mwh"]     = 0;
+        data["pf"]      = 0;
+
+        Serial.printf("Error Modbus Smart III: 0x%02X\n", err_code);
+    }
+
+    // Envío del paquete JSON a la plataforma
+    serializeJson(root, msgBuffer);
+    if (client.publish(evtTopic, msgBuffer)) {
+        Serial.println("Evento enviado a IO7 OK");
+        
+        // --- DESTELLO DEL LED INTERNO ---
+        digitalWrite(LED_BUILTIN, LOW);  // Enciende el LED (lógica inversa)
+        delay(30);                       // Pausa muy rápida de 30 ms (solo un flash)
+        digitalWrite(LED_BUILTIN, HIGH); // Apaga el LED
+        
+    } else {
+        Serial.println("Error al enviar a IO7 (Red/MQTT)");
     }
 }
 
-// ---------------------------------------------------------------------------
-// HANDLERS IO7
-// ---------------------------------------------------------------------------
 void handleUserMeta() {
     if (cfg["meta"].containsKey("pubInterval")) {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
-        if (pubInterval < 200) pubInterval = 200;
+        Serial.printf("Intervalo actualizado: %d ms\n", pubInterval);
     }
 }
 
-void handleUserCommand(char* topic, JsonDocument* root) {}
-
-// ---------------------------------------------------------------------------
-// PUBLICACIÓN DE DATOS MQTT (Llamada desde la tarea de red)
-// ---------------------------------------------------------------------------
-void publishData() {
-    StaticJsonDocument<768> root; 
-    JsonObject data = root.createNestedObject("d");
-
-    data["pps"] = round(pps * 100.0) / 100.0;
-    data["rpm"] = round(rpm * 100.0) / 100.0;
-    data["running"] = maquina_running ? 1 : 0;
-    data["uptime"] = millis() / 1000;          
-    data["reconn"] = reconnecciones_wifi;     
-    data["heap"]   = ESP.getFreeHeap();       
-    data["d18_logic"] = digitalRead(PIN_SENSOR);
-    data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
-    data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
-    data["status"] = "Online";
-    data["id"] = "Secadora";
-    data["run_time_sec"] = tiempo_running_acumulado;
-
-    serializeJson(root, msgBuffer);
-
-    if (WiFi.status() == WL_CONNECTED && client.connected()) {
-        if (client.publish(evtTopic, msgBuffer)) {
-            digitalWrite(LED_PIN, HIGH);
-            delay(50); 
-            digitalWrite(LED_PIN, LOW);
-            Serial.printf("TX OK | RPM: %.2f | Run Time: %u s\n", rpm, tiempo_running_acumulado);
-        }
-    }
+void handleUserCommand(char* topic, JsonDocument* root) {
+    // Reservado para comandos de control
 }
 
-// ---------------------------------------------------------------------------
-// TAREA EXCLUSIVA DEL CORE 0: GESTIÓN DE WIFI Y MQTT
-// ---------------------------------------------------------------------------
-void core0NetworkTask(void * pvParameters) {
-    Serial.printf("[CORE 0] Tarea de red iniciada en el núcleo: %d\n", xPortGetCoreID());
-    
-    for(;;) {
-        // Evaluamos conexión completa: WiFi conectado Y cliente MQTT en línea
-        bool mqtt_ok = (WiFi.status() == WL_CONNECTED) && client.connected();
-
-        if (mqtt_ok) {
-            if (!wifiWasConnected) {
-                wifiWasConnected = true;
-                wifiDownMillis = 0; 
-                Serial.println("[WIFI/MQTT] Conexión estable y operativa.");
-            }
-            client.loop();
-        } 
-        else {
-            // Si venía conectado y se acaba de caer (por WiFi o por fallo SSL)
-            if (wifiWasConnected) {
-                reconnecciones_wifi++; 
-                wifiWasConnected = false;
-                wifiDownMillis = millis(); // Inicia ventana de 5 minutos
-                Serial.println("[ALERTA] Enlace MQTT o WiFi perdido. Iniciando temporizador de tolerancia...");
-            }
-
-            // Si hay WiFi local pero cayó MQTT, intentamos conectar cada 5 segundos
-            if (WiFi.status() == WL_CONNECTED) {
-                static uint32_t lastTry = 0;
-                if (millis() - lastTry > 5000) {
-                    iot_connect(); 
-                    lastTry = millis();
-                }
-            }
-
-            // Si pasan 5 minutos sin lograr conectar exitosamente por MQTT/SSL o WiFi
-            if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
-                Serial.println("[CRÍTICO] 5 minutos sin reportar datos (Fallo SSL o red). Reiniciando radio WiFi...");
-                
-                WiFi.disconnect(true); 
-                vTaskDelay(pdMS_TO_TICKS(100));
-                WiFi.mode(WIFI_OFF);   
-                vTaskDelay(pdMS_TO_TICKS(100));
-                WiFi.mode(WIFI_STA);   
-                
-                const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
-                const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
-                WiFi.begin(ssid, pass); 
-
-                wifiDownMillis = millis(); // Nueva ventana de tolerancia tras resetear la radio
-            }
-        }
-
-        // PUBLICACIÓN PERIÓDICA MQTT
-        if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
-            publishData();
-            lastPublishMillis = millis();
-        }
-
-        // Respiro obligatorio para alimentar al Watchdog del Core 0
-        vTaskDelay(pdMS_TO_TICKS(10)); 
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SETUP (Ejecutado por defecto en Core 1)
-// ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(300);
-    Serial.println("\n[BOOT] Iniciando sistema de monitoreo multinúcleo...");
 
-    // --- INICIALIZAR MEMORIA FLASH Y RECUPERAR ACUMULADO ---
-    preferences.begin("estado_maq", false);
-    tiempo_running_acumulado = preferences.getUInt("run_time", 0);
-    ultimo_tiempo_guardado = tiempo_running_acumulado;
-    Serial.printf("[NVS] Tiempo running acumulado recuperado: %u segundos\n", tiempo_running_acumulado);
+    // Configuración del LED interno del ESP8266
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH); // Aseguramos que inicie apagado (HIGH)
 
-    pinMode(PIN_SENSOR, INPUT); 
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW); 
+    // Pines de control para RS-485
+    pinMode(DE_RE_PIN, OUTPUT);
+    digitalWrite(DE_RE_PIN, LOW);
 
-    debounceUs = (60000000 / (limite_rpm * 1.2)) / pulsesPerRev;
-    attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), onPulse, RISING);
+    // Inicialización del bus RS-485 a 19200 baudios
+    rs485.begin(SMART3_BAUDRATE);
+    
+    smart3Node.begin(SMART3_SLAVE_ID, rs485);
+    smart3Node.preTransmission(preTransmission);
+    smart3Node.postTransmission(postTransmission);
 
     initDevice();
+
     userMeta = handleUserMeta;
     userCommand = handleUserCommand;
+
     handleUserMeta();
 
-    if (pubInterval <= 0) pubInterval = defaultPubIntervalMs;
-    last_run_calc_millis = millis();
+    if (pubInterval <= 0) pubInterval = 5000;
 
-    const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
-    const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
-
+    // Conexión WiFi
     WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, pass);
+    WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
     
-    Serial.print("Conectando a WiFi inicial...");
-    int timeout = 0;
-    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+    Serial.print("Conectando WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
-        timeout++;
     }
+    
+    Serial.printf("\nConectado a: %s | IP: %s\n", (const char*)cfg["ssid"], WiFi.localIP().toString().c_str());
 
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WIFI] ¡Conectado con éxito al inicio!");
-        wifiWasConnected = true;
-    } else {
-        Serial.println("\n[WIFI] No se pudo conectar al inicio. Iniciando modo offline temporal.");
-        wifiWasConnected = false;
-        wifiDownMillis = millis(); 
-    }
-
-    // --- CREACIÓN DE LA TAREA EN EL CORE 0 ---
-    xTaskCreatePinnedToCore(
-        core0NetworkTask,     
-        "NetworkTask",        
-        8192,                 
-        NULL,                 
-        1,                    
-        &NetworkTaskHandle,   
-        0                     
-    );
+    // Servidor IO7
+    set_iot_server();
+    iot_connect();
 }
 
-// ---------------- -----------------------------------------------------------
-// LOOP PRINCIPAL (Ejecutado de forma limpia en el Core 1)
-// ---------------------------------------------------------------------------
 void loop() {
-    // 1. CÁLCULO DE VELOCIDAD
-    if (newData) {
-        noInterrupts();
-        unsigned long periodo = pulsePeriodUs; 
-        newData = false;
-        interrupts();
-
-        if (periodo > 0) {
-            float pps_temp = 1000000.0f / (float)periodo; 
-            float rpm_temp = (pps_temp * 60.0f / (float)pulsesPerRev);
-
-            if (rpm_temp < limite_rpm) {
-                pps = pps_temp;
-                rpm = rpm_temp;
-                maquina_running = true; 
-            }
-        }
+    // Mantener la conexión MQTT activa independientemente del Modbus
+    if (!client.connected()) {
+        iot_connect();
     }
+    
+    client.loop();
 
-// 2. DETECTOR DE PARADA
-    unsigned long localLastPulse;
-    noInterrupts();
-    localLastPulse = lastPulseTime;
-    interrupts();
-
-    if (micros() - localLastPulse > 20000000) {  
-        if (maquina_running) { 
-            rpm = 0; 
-            pps = 0;
-            maquina_running = false;
-            Serial.println("[INFO] Máquina detenida (Tiempo de espera de 20s agotado).");
-        }
-    }
-
-    // 3. LÓGICA DEL ACUMULADOR DE TIEMPO RUNNING
-    unsigned long current_millis = millis();
-    if (maquina_running) {
-        if (current_millis - last_run_calc_millis >= 1000) {
-            tiempo_running_acumulado++;
-            last_run_calc_millis = current_millis;
-
-            if (tiempo_running_acumulado - ultimo_tiempo_guardado >= 15) {
-                preferences.putUInt("run_time", tiempo_running_acumulado);
-                ultimo_tiempo_guardado = tiempo_running_acumulado;
-                Serial.printf("[NVS Autoguardado] Tiempo actualizado en Flash: %u s\n", tiempo_running_acumulado);
-            }
-        }
-    } else {
-        last_run_calc_millis = current_millis; 
-        
-        if (tiempo_running_acumulado != ultimo_tiempo_guardado) {
-            preferences.putUInt("run_time", tiempo_running_acumulado);
-            ultimo_tiempo_guardado = tiempo_running_acumulado;
-            Serial.printf("[NVS Parada] Tiempo guardado al detenerse la máquina: %u s\n", tiempo_running_acumulado);
-        }
+    // Temporizador no bloqueante para publicación de datos
+    if ((pubInterval != 0) && (millis() - lastPublishMillis > (unsigned long)pubInterval)) {
+        publishData();
+        lastPublishMillis = millis();
     }
 }
