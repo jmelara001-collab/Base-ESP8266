@@ -1,136 +1,82 @@
 #include <Arduino.h>
 #include <IO7F8266.h>
-#include <SoftwareSerial.h>
-#include <ModbusMaster.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 
-// ==========================================
-// CONFIGURACIÓN PINOUT RS-485 / MODBUS
-// ==========================================
-#define RX_PIN 14    // D5 (GPIO14) -> RO del MAX485
-#define TX_PIN 12    // D6 (GPIO12) -> DI del MAX485
-#define DE_RE_PIN 4  // D2 (GPIO4)  -> DE y RE unidos
+// Instanciar el ADC ADS1115
+Adafruit_ADS1115 ads;
 
-// Parámetros confirmados del Circutor Computer Smart III
-#define SMART3_SLAVE_ID 1
-#define SMART3_BAUDRATE 19200
+// Pines I2C asignados según el estándar del ESP-12E
+#define I2C_SDA 4  // GPIO4
+#define I2C_SCL 5  // GPIO5
 
-SoftwareSerial rs485(RX_PIN, TX_PIN);
-ModbusMaster smart3Node;
+// Multiplicador directo: Convierte el voltaje leído (V_RMS) a Amperios reales (0 a 50A)
+const float FACTOR_DONA_DIRECTA = 50.0; 
 
-// Variables obligatorias para IO7F8266
+// Variables globales para almacenar las lecturas procesadas
+float vRMS = 0.0;
+float corrienteReal50A = 0.0;
+
+// Variable obligatoria para la librería IO7
 String user_html = "";
-char* ssid_pfix = (char*)"IOT_Device";
 
-// Control de tiempo para publicación
-unsigned long lastPublishMillis = -pubInterval;
+// Prefijo para el nombre del AP de configuración
+char* ssid_pfix = (char*)"L1M1_IOT_Device";
 
-// Control de dirección para el transceptor MAX485
-void preTransmission() {
-    digitalWrite(DE_RE_PIN, HIGH);
-    delayMicroseconds(200);
+// Control de tiempo para publicación de alta resolución (100ms = 10Hz)
+unsigned long lastPublishMillis = 0;
+const unsigned long INTERVALO_ENVIO_MS = 100; 
+
+/**
+ * Captura EXACTAMENTE 1 ciclo completo de red a 60 Hz (16666 microsegundos).
+ * Esto elimina la inercia del promedio de 200ms y entrega el comportamiento real de la corriente.
+ */
+float calcularVoltajeRMS() {
+    double sumaCuadrados = 0;
+    int numeroMuestras = 0;
+    unsigned long tiempoInicio = micros();
+    
+    // Muestreo enfocado en 1 ciclo de 60Hz
+    while (micros() - tiempoInicio < 16666) {
+        int16_t lecturaRaw = ads.readADC_Differential_2_3();
+        float voltajeInstantaneo = lecturaRaw * 0.000125; // GAIN_ONE -> 0.125mV por bit
+        sumaCuadrados += (voltajeInstantaneo * voltajeInstantaneo);
+        numeroMuestras++;
+    }
+    
+    if (numeroMuestras == 0) return 0.0;
+    return sqrt((float)(sumaCuadrados / numeroMuestras));
 }
 
-void postTransmission() {
-    delayMicroseconds(200);
-    digitalWrite(DE_RE_PIN, LOW);
-}
-
-// Unir dos registros de 16 bits (High y Low) a 32 bits según el estándar del Smart III
-uint32_t combineRegisters(uint16_t high, uint16_t low) {
-    return ((uint32_t)high << 16) | low;
-}
-
-// ==========================================
-// FUNCIÓN DE PUBLICACIÓN A PLATAFORMA IO7
-// ==========================================
 void publishData() {
     StaticJsonDocument<512> root;
     JsonObject data = root.createNestedObject("d");
     
-    // Variables temporales para almacenar lecturas
-    float kw_inst = 0;
-    float pf = 0;
-    float mwh = 0;
-    bool read_ok = true;
-    uint8_t err_code = 0;
-
-    // --- LECTURA 1: Potencia Instantánea y Cos Phi (Pantalla Principal) ---
-    // Leemos 18 registros empezando en 0x0052 hasta 0x0063
-    uint8_t result1 = smart3Node.readInputRegisters(0x0052, 18);
-
-    if (result1 == smart3Node.ku8MBSuccess) {
-        // Potencia Activa Instantánea (0x0052) -> Offset 0 y 1
-        uint32_t rawW = combineRegisters(smart3Node.getResponseBuffer(0), smart3Node.getResponseBuffer(1));
-        
-        // Cos Phi trifásico (0x0062) -> Offset 16 y 17 (0x62 - 0x52 = 0x10 = 16 decimal)
-        // Este es el valor que el Circutor muestra en su pantalla principal para la compensación
-        uint32_t rawCosPhi = combineRegisters(smart3Node.getResponseBuffer(16), smart3Node.getResponseBuffer(17));
-        
-        kw_inst = rawW / 1000.0;    // Convertir Vatios a Kilovatios
-        
-        // Autodetección de escala para el Cos Phi
-        if (rawCosPhi > 100) {
-            pf = rawCosPhi / 1000.0;    // Escala x1000 (Ej. 937 -> 0.94)
-        } else {
-            pf = rawCosPhi / 100.0;     // Escala x100 (Ej. 94 -> 0.94)
-        }
-        
-    } else {
-        read_ok = false;
-        err_code = result1;
+    // 1. Muestreo ultrarrápido de 1 ciclo (16.6ms)
+    vRMS = calcularVoltajeRMS();
+    
+    // Filtro para eliminar el ruido de fondo constante (4.5mV de offset)
+    if (vRMS <= 0.0046) {
+        vRMS = 0.0;
     }
 
-    // Pequeña pausa para no saturar el bus RS-485
-    delay(50);
+    // 2. Cálculo directo (Voltaje RMS * Factor de la Dona)
+    corrienteReal50A = vRMS * FACTOR_DONA_DIRECTA; 
+    
+    // 3. Conversión a 3 decimales
+    String vRMS_str = String(vRMS, 3);
+    String iReal_str = String(corrienteReal50A, 3);
 
-    // --- LECTURA 2: Energía Activa Consumida ---
-    // Leemos 2 registros desde 0x0088 (Energía activa consumida en kWh)
-    uint8_t result2 = smart3Node.readInputRegisters(0x0088, 2);
+    // 4. Formato de JSON idéntico al tuyo
+    data["status"] = "running";
+    data["v_real"] = vRMS_str;  
+    data["i_real"] = iReal_str; // Envía la corriente directa de 0 a 50A
 
-    if (result2 == smart3Node.ku8MBSuccess) {
-        // Energía Acumulada (0x0088) -> Offset 0 y 1
-        uint32_t rawKWh = combineRegisters(smart3Node.getResponseBuffer(0), smart3Node.getResponseBuffer(1));
-        
-        // Conversión a Megavatios-hora (MWh) dividiendo entre 1000
-        mwh = rawKWh / 1000.0; 
-    } else {
-        read_ok = false;
-        err_code = result2; // Sobrescribe el error si la lectura 2 falla
-    }
-
-    // --- CONSTRUCCIÓN DEL JSON ---
-    if (read_ok) {
-        data["status"] = "ok";
-        
-        // Convertimos a texto con 2 decimales limpios
-        data["kw_inst"] = serialized(String(kw_inst, 2));
-        data["mwh"]     = serialized(String(mwh, 2));
-        data["pf"]      = serialized(String(pf, 2)); // Mandamos el Cos Phi bajo la etiqueta pf
-
-        Serial.printf("Smart III OK | kW Inst: %.2f kW | MWh Acumulado: %.2f MWh | Cos phi (Pantalla): %.2f\n", kw_inst, mwh, pf);
-    } else {
-        // Reportar error de bus Modbus a IO7
-        data["status"] = "modbus_error";
-        data["modbus_code"] = err_code;
-        data["kw_inst"] = 0;
-        data["mwh"]     = 0;
-        data["pf"]      = 0;
-
-        Serial.printf("Error Modbus Smart III: 0x%02X\n", err_code);
-    }
-
-    // Envío del paquete JSON a la plataforma
     serializeJson(root, msgBuffer);
     if (client.publish(evtTopic, msgBuffer)) {
-        Serial.println("Evento enviado a IO7 OK");
-        
-        // --- DESTELLO DEL LED INTERNO ---
-        digitalWrite(LED_BUILTIN, LOW);  // Enciende el LED (lógica inversa)
-        delay(30);                       // Pausa muy rápida de 30 ms (solo un flash)
-        digitalWrite(LED_BUILTIN, HIGH); // Apaga el LED
-        
+        // Publicación silenciosa o mínima para no retrasar el bucle
     } else {
-        Serial.println("Error al enviar a IO7 (Red/MQTT)");
+        Serial.println("Error al enviar a IO7");
     }
 }
 
@@ -142,26 +88,23 @@ void handleUserMeta() {
 }
 
 void handleUserCommand(char* topic, JsonDocument* root) {
-    // Reservado para comandos de control
+    // Lógica de comandos si es necesaria
 }
 
 void setup() {
     Serial.begin(115200);
 
-    // Configuración del LED interno del ESP8266
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, HIGH); // Aseguramos que inicie apagado (HIGH)
+    // Bus I2C a 400kHz para máxima velocidad de lectura del ADS1115
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000);
 
-    // Pines de control para RS-485
-    pinMode(DE_RE_PIN, OUTPUT);
-    digitalWrite(DE_RE_PIN, LOW);
-
-    // Inicialización del bus RS-485 a 19200 baudios
-    rs485.begin(SMART3_BAUDRATE);
+    if (!ads.begin()) {
+        Serial.println("¡Error Crítico! No se pudo encontrar el ADS1115.");
+        while (1);
+    }
     
-    smart3Node.begin(SMART3_SLAVE_ID, rs485);
-    smart3Node.preTransmission(preTransmission);
-    smart3Node.postTransmission(postTransmission);
+    ads.setGain(GAIN_ONE);
+    ads.setDataRate(RATE_ADS1115_860SPS);
 
     initDevice();
 
@@ -170,9 +113,6 @@ void setup() {
 
     handleUserMeta();
 
-    if (pubInterval <= 0) pubInterval = 5000;
-
-    // Conexión WiFi
     WiFi.mode(WIFI_STA);
     WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
     
@@ -184,21 +124,19 @@ void setup() {
     
     Serial.printf("\nConectado a: %s | IP: %s\n", (const char*)cfg["ssid"], WiFi.localIP().toString().c_str());
 
-    // Servidor IO7
     set_iot_server();
     iot_connect();
 }
 
 void loop() {
-    // Mantener la conexión MQTT activa independientemente del Modbus
     if (!client.connected()) {
         iot_connect();
     }
     
     client.loop();
 
-    // Temporizador no bloqueante para publicación de datos
-    if ((pubInterval != 0) && (millis() - lastPublishMillis > (unsigned long)pubInterval)) {
+    // Muestrea y publica en tiempo real cada 100 ms (10 lecturas por segundo)
+    if (millis() - lastPublishMillis >= INTERVALO_ENVIO_MS) {
         publishData();
         lastPublishMillis = millis();
     }
