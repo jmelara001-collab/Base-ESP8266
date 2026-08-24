@@ -1,171 +1,213 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_ADS1X15.h>
-#include <WiFi.h>
-#include <IO7F32.h> // Cambiado a la versión de librería compatible con ESP32
+#include <WiFi.h>      
+#include <IO7F32.h>    
 
-// Instanciar el ADC ADS1115
-Adafruit_ADS1115 ads;
+// ===========================================================================
+// ⚙️ CONFIGURACIÓN DEL USUARIO (Variables físicas de la máquina)
+// ===========================================================================
 
-// Pines I2C por defecto en el ESP32 DevKit V1
-#define I2C_SDA 18  // GPIO21 (SDA)
-#define I2C_SCL 19  // GPIO22 (SCL)
+// 1. LÍMITE FÍSICO MÁXIMO (Para calcular el filtro anti-ruido)
+float limite_ppm_max = 5000.0 / 60.0; 
 
-// Multiplicador directo: Convierte el voltaje leído (V_RMS) a Amperios reales (0 a 50A)
-const float FACTOR_DONA_DIRECTA = 50.0; 
+// 2. PULSOS POR PRODUCTO
+int pulsesPerRev = 1;        
 
-// Variables globales para almacenar las lecturas procesadas
-float vRMS = 0.0;
-float vPico = 0.0;
-float corrienteReal50A = 0.0;
-float corrientePico50A = 0.0;
-float factorCresta = 0.0;
+// 3. MODO DE DETECCIÓN DEL SENSOR 
+int modo_deteccion = RISING; 
+// ===========================================================================
 
-// Variable obligatoria para la librería IO7
-String user_html = "";
+const int PIN_SENSOR = 18; 
+const int LED_PIN = 2;     
 
-// Prefijo para el nombre del AP de configuración
-char* ssid_pfix = (char*)"M1_IOT_Device";
+void core0NetworkTask(void * pvParameters);
+void publishData();
+void handleUserMeta();
+void handleUserCommand(char* topic, JsonDocument* root);
+IRAM_ATTR void onPulse();
 
-// Control de tiempo para publicación de alta resolución (100ms = 10Hz)
+unsigned long wifiDownMillis = 0;       
+const unsigned long RESTART_TIMEOUT = 300000; 
+
+String user_html = "";  
+char* ssid_pfix = (char*)"IOT_DEVICE";
 unsigned long lastPublishMillis = 0;
-const unsigned long INTERVALO_ENVIO_MS = 100; 
+int defaultPubIntervalMs = 5000; 
 
-/**
- * Captura EXACTAMENTE 1 ciclo completo de red a 60 Hz (16666 us).
- * Mide el RMS y registra el Pico Instantáneo para análisis de distorsión/IA.
- */
-void calcularMetricasCiclo() {
-    double sumaCuadrados = 0;
-    int numeroMuestras = 0;
-    float picoDetectado = 0.0;
-    unsigned long tiempoInicio = micros();
+// --- VARIABLES INTERNAS DE CONTEO ---
+unsigned long debounceUs;    
+volatile uint32_t pulsos_crudos = 0; 
+volatile uint32_t contador_producto = 0; 
+volatile unsigned long lastPulseTime = 0;
+
+uint32_t reconnecciones_wifi = 0;   
+bool wifiWasConnected = false;      
+TaskHandle_t NetworkTaskHandle;
+
+// ---------------------------------------------------------------------------
+// INTERRUPCIÓN (ISR) - ACUMULADOR ABSOLUTO
+// ---------------------------------------------------------------------------
+IRAM_ATTR void onPulse() {
+    unsigned long now = micros();
     
-    // Muestreo enfocado en 1 ciclo de 60Hz
-    while (micros() - tiempoInicio < 16666) {
-        int16_t lecturaRaw = ads.readADC_Differential_2_3();
-        float voltajeInstantaneo = lecturaRaw * 0.000125; // GAIN_ONE -> 0.125mV por bit
-        
-        float valAbs = fabs(voltajeInstantaneo);
-        if (valAbs > picoDetectado) {
-            picoDetectado = valAbs; // Retiene el punto más alto del ciclo
-        }
-
-        sumaCuadrados += (voltajeInstantaneo * voltajeInstantaneo);
-        numeroMuestras++;
-    }
-    
-    if (numeroMuestras == 0) {
-        vRMS = 0.0;
-        vPico = 0.0;
-        return;
-    }
-
-    vRMS = sqrt((float)(sumaCuadrados / numeroMuestras));
-    vPico = picoDetectado;
-}
-
-void publishData() {
-    StaticJsonDocument<512> root;
-    JsonObject data = root.createNestedObject("d");
-    
-    // 1. Muestreo del ciclo
-    calcularMetricasCiclo();
-    
-    // Filtro para eliminar el ruido de fondo constante
-    if (vRMS <= 0.01) {
-        vRMS = 0.0;
-        vPico = 0.0;
-    }
-
-    // 2. Cálculos directos de magnitudes físicas
-    corrienteReal50A = vRMS * FACTOR_DONA_DIRECTA; 
-    corrientePico50A = vPico * FACTOR_DONA_DIRECTA;
-
-    // Cálculo del Factor de Cresta (Métrica extra para el modelo de IA)
-    if (corrienteReal50A > 0.1) {
-        factorCresta = corrientePico50A / corrienteReal50A;
-    } else {
-        factorCresta = 0.0;
-    }
-    
-    // 3. Conversión a cadenas de texto de alta precisión
-    String vRMS_str = String(vRMS, 3);
-    String iReal_str = String(corrienteReal50A, 3);
-    String iPico_str = String(corrientePico50A, 3);
-    String fCresta_str = String(factorCresta, 2);
-
-    // 4. Formato JSON enriquecido para monitoreo e IA
-    data["status"] = "running";
-    data["v_real"] = vRMS_str;  
-    data["i_real"] = iReal_str;     // Corriente RMS (0 a 50A)
-    data["i_pico"] = iPico_str;     // Pico de corriente instantáneo
-    data["f_cresta"] = fCresta_str; // Indicador de deformación (Normal sin distorsión ~1.41)
-
-    serializeJson(root, msgBuffer);
-    if (!client.publish(evtTopic, msgBuffer)) {
-        Serial.println("Error al enviar a IO7");
+    // Filtro anti-ruido: ignora rebotes que ocurran más rápido que la velocidad máxima
+    if (now - lastPulseTime > debounceUs) {
+        pulsos_crudos++; 
+        contador_producto = pulsos_crudos / pulsesPerRev; 
+        lastPulseTime = now;
     }
 }
 
+// ---------------------------------------------------------------------------
+// HANDLERS IO7
+// ---------------------------------------------------------------------------
 void handleUserMeta() {
     if (cfg["meta"].containsKey("pubInterval")) {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
-        Serial.printf("Intervalo actualizado: %d ms\n", pubInterval);
+        if (pubInterval < 200) pubInterval = 200;
     }
 }
 
-void handleUserCommand(char* topic, JsonDocument* root) {
-    // Lógica de comandos
+void handleUserCommand(char* topic, JsonDocument* root) {}
+
+// ---------------------------------------------------------------------------
+// PUBLICACIÓN DE DATOS MQTT 
+// ---------------------------------------------------------------------------
+void publishData() {
+    // Redujimos a 512 porque el paquete ahora es más limpio y ligero
+    StaticJsonDocument<512> root; 
+    JsonObject data = root.createNestedObject("d");
+
+    // Datos de producción puros
+    data["conteo"] = contador_producto;
+    data["pulsos_raw"] = pulsos_crudos; 
+    
+    // Datos útiles de diagnóstico para supervisión
+    data["uptime"] = millis() / 1000;          
+    data["reconn"] = reconnecciones_wifi;     
+    data["heap"]   = ESP.getFreeHeap();       
+    data["d18_logic"] = digitalRead(PIN_SENSOR);
+    data["wifi_rssi"] = WiFi.RSSI(); 
+
+    serializeJson(root, msgBuffer);
+
+    if (WiFi.status() == WL_CONNECTED && client.connected()) {
+        if (client.publish(evtTopic, msgBuffer)) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(50); 
+            digitalWrite(LED_PIN, LOW);
+            Serial.printf("TX OK | Total Acumulado: %u cajas\n", contador_producto);
+        }
+    }
 }
 
+// ---------------------------------------------------------------------------
+// TAREA CORE 0: RED (Intacta)
+// ---------------------------------------------------------------------------
+void core0NetworkTask(void * pvParameters) {
+    Serial.printf("[CORE 0] Tarea de red iniciada en el núcleo: %d\n", xPortGetCoreID());
+    
+    for(;;) {
+        bool mqtt_ok = (WiFi.status() == WL_CONNECTED) && client.connected();
+
+        if (mqtt_ok) {
+            if (!wifiWasConnected) {
+                wifiWasConnected = true;
+                wifiDownMillis = 0; 
+            }
+            client.loop();
+        } 
+        else {
+            if (wifiWasConnected) {
+                reconnecciones_wifi++; 
+                wifiWasConnected = false;
+                wifiDownMillis = millis(); 
+            }
+
+            if (WiFi.status() == WL_CONNECTED) {
+                static uint32_t lastTry = 0;
+                if (millis() - lastTry > 5000) {
+                    iot_connect(); 
+                    lastTry = millis();
+                }
+            }
+
+            if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
+                WiFi.disconnect(true); 
+                vTaskDelay(pdMS_TO_TICKS(100));
+                WiFi.mode(WIFI_OFF);   
+                vTaskDelay(pdMS_TO_TICKS(100));
+                WiFi.mode(WIFI_STA);   
+                
+                const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
+                const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
+                WiFi.begin(ssid, pass); 
+                wifiDownMillis = millis(); 
+            }
+        }
+
+        if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
+            publishData();
+            lastPublishMillis = millis();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SETUP 
+// ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
+    delay(300);
 
-    // Inicialización del bus I2C en los pines por defecto del ESP32
-    Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000); // 400 kHz
+    pinMode(PIN_SENSOR, INPUT); 
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW); 
 
-    if (!ads.begin()) {
-        Serial.println("¡Error Crítico! No se pudo encontrar el ADS1115.");
-        while (1);
-    }
+    // Cálculo del filtro anti-ruido (Debounce)
+    debounceUs = (60000000 / (limite_ppm_max * 1.2)) / pulsesPerRev;
     
-    ads.setGain(GAIN_ONE);
-    ads.setDataRate(RATE_ADS1115_860SPS);
+    attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), onPulse, modo_deteccion);
 
     initDevice();
-
     userMeta = handleUserMeta;
     userCommand = handleUserCommand;
-
     handleUserMeta();
 
+    if (pubInterval <= 0) pubInterval = defaultPubIntervalMs;
+
+    const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
+    const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
+
     WiFi.mode(WIFI_STA);
-    WiFi.begin((const char*)cfg["ssid"], (const char*)cfg["w_pw"]);
+    WiFi.begin(ssid, pass);
     
-    Serial.print("Conectando WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        Serial.print(".");
+    int timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+        delay(500);
+        timeout++;
     }
     
-    Serial.printf("\nConectado a: %s | IP: %s\n", (const char*)cfg["ssid"], WiFi.localIP().toString().c_str());
+    if (WiFi.status() == WL_CONNECTED) wifiWasConnected = true;
+    else { wifiWasConnected = false; wifiDownMillis = millis(); }
 
-    set_iot_server();
-    iot_connect();
+    xTaskCreatePinnedToCore(
+        core0NetworkTask,     
+        "NetworkTask",        
+        8192,                 
+        NULL,                 
+        1,                    
+        &NetworkTaskHandle,   
+        0                     
+    );
 }
 
+// ---------------------------------------------------------------------------
+// LOOP PRINCIPAL
+// ---------------------------------------------------------------------------
 void loop() {
-    if (!client.connected()) {
-        iot_connect();
-    }
-    
-    client.loop();
-
-    // Muestreo y envío a 10 Hz (100 ms)
-    if (millis() - lastPublishMillis >= INTERVALO_ENVIO_MS) {
-        publishData();
-        lastPublishMillis = millis();
-    }
+    // Al actuar como acumulador puro manejado por interrupciones y FreeRTOS, 
+    // el loop de Arduino no necesita procesar nada, liberando el 100% del procesador.
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
