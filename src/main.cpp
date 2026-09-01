@@ -1,16 +1,16 @@
 #include <Arduino.h>
-#include <WiFi.h>      
-#include <IO7F32.h>    
+#include <ESP8266WiFi.h>
+#include <IO7F8266.h>     
 
 // --- PROTOTIPOS DE FUNCIONES ---
-void core0NetworkTask(void * pvParameters);
+void handleNetworkTask();
 void publishData();
 void handleUserMeta();
 void handleUserCommand(char* topic, JsonDocument* root);
 
 // --- VARIABLES PARA EL CONTROL DE RED ---
 unsigned long wifiDownMillis = 0;       
-const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline (WiFi o SSL) antes de reiniciar radio
+const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline antes de reiniciar radio
 
 String user_html = "";  
 char* ssid_pfix = (char*)"IOT_Device";
@@ -23,10 +23,7 @@ bool wifiWasConnected = false;
 
 // --- VARIABLES DE TU PROCESO ---
 // (Agrega aquí las variables de tu propio proceso)
-const int LED_PIN = 2; // Se mantiene para indicar el envío de datos MQTT
-
-// --- TAREA PARA EL CORE 0 (RED) ---
-TaskHandle_t NetworkTaskHandle;
+const int LED_PIN = 2;  // Se mantiene para indicar el envío de datos MQTT
 
 // ---------------------------------------------------------------------------
 // HANDLERS IO7
@@ -45,7 +42,7 @@ void handleUserCommand(char* topic, JsonDocument* root) {
 }
 
 // ---------------------------------------------------------------------------
-// PUBLICACIÓN DE DATOS MQTT (Llamada desde la tarea de red)
+// PUBLICACIÓN DE DATOS MQTT 
 // ---------------------------------------------------------------------------
 void publishData() {
     StaticJsonDocument<768> root; 
@@ -54,7 +51,7 @@ void publishData() {
     // --- VARIABLES DE TU PROCESO ---
     // Ejemplo: data["mi_sensor"] = valor_sensor;
     
-    // --- VARIABLES DE ESTADO ORIGINAL (ESQUELETO) ---
+    // --- VARIABLES DE ESTADO ORIGINAL ---
     data["uptime"] = millis() / 1000;          
     data["reconn"] = reconnecciones_wifi;     
     data["heap"]   = ESP.getFreeHeap();        
@@ -66,70 +63,64 @@ void publishData() {
 
     if (WiFi.status() == WL_CONNECTED && client.connected()) {
         if (client.publish(evtTopic, msgBuffer)) {
-            digitalWrite(LED_PIN, HIGH);
+            digitalWrite(LED_PIN, LOW); // Adaptado a lógica inversa de ESP8266 si es el LED integrado
             delay(50); 
-            digitalWrite(LED_PIN, LOW);
+            digitalWrite(LED_PIN, HIGH);
             Serial.printf("TX OK | Uptime: %lu\n", millis() / 1000);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// TAREA EXCLUSIVA DEL CORE 0: GESTIÓN DE WIFI Y MQTT
+// FUNCIÓN COOPERATIVA DE GESTIÓN DE WIFI Y MQTT
 // ---------------------------------------------------------------------------
-void core0NetworkTask(void * pvParameters) {
-    Serial.printf("[CORE 0] Tarea de red iniciada en el núcleo: %d\n", xPortGetCoreID());
-    
-    for(;;) {
-        bool mqtt_ok = (WiFi.status() == WL_CONNECTED) && client.connected();
+void handleNetworkTask() {
+    bool mqtt_ok = (WiFi.status() == WL_CONNECTED) && client.connected();
 
-        if (mqtt_ok) {
-            if (!wifiWasConnected) {
-                wifiWasConnected = true;
-                wifiDownMillis = 0; 
-                Serial.println("[WIFI/MQTT] Conexión estable y operativa.");
-            }
-            client.loop();
-        } 
-        else {
-            if (wifiWasConnected) {
-                reconnecciones_wifi++; 
-                wifiWasConnected = false;
-                wifiDownMillis = millis(); 
-                Serial.println("[ALERTA] Enlace MQTT o WiFi perdido. Iniciando temporizador de tolerancia...");
-            }
+    if (mqtt_ok) {
+        if (!wifiWasConnected) {
+            wifiWasConnected = true;
+            wifiDownMillis = 0; 
+            Serial.println("[WIFI/MQTT] Conexión estable y operativa.");
+        }
+        client.loop(); // Mantiene viva la conexión MQTT
+    } 
+    else {
+        if (wifiWasConnected) {
+            reconnecciones_wifi++; 
+            wifiWasConnected = false;
+            wifiDownMillis = millis(); 
+            Serial.println("[ALERTA] Enlace MQTT o WiFi perdido. Iniciando temporizador de tolerancia...");
+        }
 
-            if (WiFi.status() == WL_CONNECTED) {
-                static uint32_t lastTry = 0;
-                if (millis() - lastTry > 5000) {
-                    iot_connect(); 
-                    lastTry = millis();
-                }
-            }
-
-            if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
-                Serial.println("[CRÍTICO] 5 minutos sin reportar datos. Reiniciando radio WiFi...");
-                
-                WiFi.disconnect(true); 
-                vTaskDelay(pdMS_TO_TICKS(100));
-                WiFi.mode(WIFI_OFF);   
-                vTaskDelay(pdMS_TO_TICKS(100));
-                WiFi.mode(WIFI_STA);   
-                
-                const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
-                const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
-                WiFi.begin(ssid, pass); 
-
-                wifiDownMillis = millis(); 
+        if (WiFi.status() == WL_CONNECTED) {
+            static uint32_t lastTry = 0;
+            if (millis() - lastTry > 5000) {
+                iot_connect(); // Función provista asumo por tu librería base
+                lastTry = millis();
             }
         }
 
-        if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
-            publishData();
-            lastPublishMillis = millis();
-        }
+        if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
+            Serial.println("[CRÍTICO] 5 minutos sin reportar datos. Reiniciando radio WiFi...");
+            
+            WiFi.disconnect(true); 
+            delay(100); // En ESP8266 delay() alimenta el Watchdog automáticamente
+            WiFi.mode(WIFI_OFF);   
+            delay(100);
+            WiFi.mode(WIFI_STA);   
+            
+            const char* ssid = cfg["ssid"] ? (const char*)cfg["ssid"] : nullptr;
+            const char* pass = cfg["w_pw"] ? (const char*)cfg["w_pw"] : nullptr;
+            WiFi.begin(ssid, pass); 
 
-        vTaskDelay(pdMS_TO_TICKS(10)); 
+            wifiDownMillis = millis(); 
+        }
+    }
+
+    if (pubInterval > 0 && millis() - lastPublishMillis > (unsigned long)pubInterval) {
+        publishData();
+        lastPublishMillis = millis();
     }
 }
 
@@ -143,9 +134,9 @@ void setup() {
 
     // --- CONFIGURACIÓN DE PINES DE TU PROCESO ---
     // (Tus pinMode van aquí)
-    
+
     pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW); 
+    digitalWrite(LED_PIN, HIGH);
 
     initDevice();
     userMeta = handleUserMeta;
@@ -177,24 +168,19 @@ void setup() {
         wifiDownMillis = millis(); 
     }
 
-    xTaskCreatePinnedToCore(
-        core0NetworkTask,     
-        "NetworkTask",        
-        8192,                 
-        NULL,                 
-        1,                    
-        &NetworkTaskHandle,   
-        0                     
-    );
+    // ELIMINADO: xTaskCreatePinnedToCore() ya no aplica aquí
 }
 
 // ---------------------------------------------------------------------------
 // LOOP PRINCIPAL 
 // ---------------------------------------------------------------------------
 void loop() {
+    // 1. Llamada a la gestión de red cooperativa
+    handleNetworkTask(); 
+
     // --- LÓGICA DE TU PROCESO AQUÍ ---
     // Este espacio queda libre para que programes tu aplicación
     
     
-    vTaskDelay(pdMS_TO_TICKS(10)); // Pequeño retardo recomendado si el loop está vacío o corre muy rápido
+    yield();
 }
