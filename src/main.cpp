@@ -26,7 +26,7 @@ const float VOLTAJE_MIN = 0.0;
 const float VOLTAJE_MAX = 3.3;
 
 const float VALOR_MIN = 8.0;       
-const float VALOR_MAX = 152.0;     
+const float VALOR_MAX = 150.0;     
 
 const int LED_PIN = 2;
 
@@ -188,10 +188,24 @@ void loop() {
     // --- LÓGICA DE TU PROCESO ---
     if (millis() - lastSensorReadMillis > 100) {
         
-        adc_raw = analogRead(A0);      
-        voltaje = adc_raw * (3.3 / 1023.0);
+        // 1. Tomamos 50 lecturas rápidas y las sumamos
+        long suma_adc = 0;
+        int muestras = 100;
         
+        for (int i = 0; i < muestras; i++) {
+            suma_adc += analogRead(A0);
+        }
+        
+        // 2. Sacamos el promedio
+        adc_raw = suma_adc / muestras;      
+        
+        // 3. Cálculos que ya tenías
+        voltaje = adc_raw * (3.3 / 1023.0);
         medicion_final = ((voltaje - VOLTAJE_MIN) * ((VALOR_MAX - VALOR_MIN) / (VOLTAJE_MAX - VOLTAJE_MIN))) + VALOR_MIN;
+        
+        // 4. Redondeo a 2 decimales
+        voltaje = round(voltaje * 100.0) / 100.0;
+        medicion_final = round(medicion_final * 100.0) / 100.0;
         
         lastSensorReadMillis = millis();
     }
