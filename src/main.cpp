@@ -10,10 +10,10 @@ void handleUserCommand(char* topic, JsonDocument* root);
 
 // --- VARIABLES PARA EL CONTROL DE RED ---
 unsigned long wifiDownMillis = 0;       
-const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline antes de reiniciar radio
+const unsigned long RESTART_TIMEOUT = 300000; 
 
 String user_html = "";  
-char* ssid_pfix = (char*)"IOT_Device";
+char* ssid_pfix = (char*)"VMB-33";
 
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
@@ -22,8 +22,19 @@ uint32_t reconnecciones_wifi = 0;
 bool wifiWasConnected = false;      
 
 // --- VARIABLES DE TU PROCESO ---
-// (Agrega aquí las variables de tu propio proceso)
-const int LED_PIN = 2;  // Se mantiene para indicar el envío de datos MQTT
+const float VOLTAJE_MIN = 0.0; 
+const float VOLTAJE_MAX = 3.3;
+
+const float VALOR_MIN = 8.0;       
+const float VALOR_MAX = 152.0;     
+
+const int LED_PIN = 2;
+
+// --- VARIABLES INTERNAS ---
+int adc_raw = 0;
+float voltaje = 0.0;
+float medicion_final = 0.0;
+unsigned long lastSensorReadMillis = 0;
 
 // ---------------------------------------------------------------------------
 // HANDLERS IO7
@@ -33,7 +44,7 @@ void handleUserMeta() {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
         if (pubInterval < 200) pubInterval = 200;
     }
-    
+
     // (Agrega aquí el ajuste dinámico de parámetros de tu proceso)
 }
 
@@ -49,21 +60,23 @@ void publishData() {
     JsonObject data = root.createNestedObject("d");
 
     // --- VARIABLES DE TU PROCESO ---
-    // Ejemplo: data["mi_sensor"] = valor_sensor;
+    data["adc_raw"] = adc_raw;
+    data["voltaje"] = voltaje;
+    data["unidades"]  = medicion_final; 
     
     // --- VARIABLES DE ESTADO ORIGINAL ---
-    data["uptime"] = millis() / 1000;          
-    data["reconn"] = reconnecciones_wifi;     
-    data["heap"]   = ESP.getFreeHeap();        
+    data["uptime"]    = millis() / 1000;           
+    data["reconn"]    = reconnecciones_wifi;     
+    data["heap"]      = ESP.getFreeHeap();         
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
-    data["status"] = "Online";
+    data["status"]    = "Online";
 
     serializeJson(root, msgBuffer);
 
     if (WiFi.status() == WL_CONNECTED && client.connected()) {
         if (client.publish(evtTopic, msgBuffer)) {
-            digitalWrite(LED_PIN, LOW); // Adaptado a lógica inversa de ESP8266 si es el LED integrado
+            digitalWrite(LED_PIN, LOW); 
             delay(50); 
             digitalWrite(LED_PIN, HIGH);
             Serial.printf("TX OK | Uptime: %lu\n", millis() / 1000);
@@ -83,29 +96,28 @@ void handleNetworkTask() {
             wifiDownMillis = 0; 
             Serial.println("[WIFI/MQTT] Conexión estable y operativa.");
         }
-        client.loop(); // Mantiene viva la conexión MQTT
+        client.loop(); 
     } 
     else {
         if (wifiWasConnected) {
             reconnecciones_wifi++; 
             wifiWasConnected = false;
             wifiDownMillis = millis(); 
-            Serial.println("[ALERTA] Enlace MQTT o WiFi perdido. Iniciando temporizador de tolerancia...");
+            Serial.println("[ALERTA] Enlace MQTT o WiFi perdido...");
         }
 
         if (WiFi.status() == WL_CONNECTED) {
             static uint32_t lastTry = 0;
             if (millis() - lastTry > 5000) {
-                iot_connect(); // Función provista asumo por tu librería base
+                iot_connect(); 
                 lastTry = millis();
             }
         }
 
         if (wifiDownMillis != 0 && (millis() - wifiDownMillis > RESTART_TIMEOUT)) {
             Serial.println("[CRÍTICO] 5 minutos sin reportar datos. Reiniciando radio WiFi...");
-            
             WiFi.disconnect(true); 
-            delay(100); // En ESP8266 delay() alimenta el Watchdog automáticamente
+            delay(100); 
             WiFi.mode(WIFI_OFF);   
             delay(100);
             WiFi.mode(WIFI_STA);   
@@ -133,8 +145,6 @@ void setup() {
     Serial.println("\n[BOOT] Iniciando sistema");
 
     // --- CONFIGURACIÓN DE PINES DE TU PROCESO ---
-    // (Tus pinMode van aquí)
-
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);
 
@@ -167,20 +177,24 @@ void setup() {
         wifiWasConnected = false;
         wifiDownMillis = millis(); 
     }
-
-    // ELIMINADO: xTaskCreatePinnedToCore() ya no aplica aquí
 }
 
 // ---------------------------------------------------------------------------
 // LOOP PRINCIPAL 
 // ---------------------------------------------------------------------------
 void loop() {
-    // 1. Llamada a la gestión de red cooperativa
     handleNetworkTask(); 
 
-    // --- LÓGICA DE TU PROCESO AQUÍ ---
-    // Este espacio queda libre para que programes tu aplicación
-    
+    // --- LÓGICA DE TU PROCESO ---
+    if (millis() - lastSensorReadMillis > 100) {
+        
+        adc_raw = analogRead(A0);      
+        voltaje = adc_raw * (3.3 / 1023.0);
+        
+        medicion_final = ((voltaje - VOLTAJE_MIN) * ((VALOR_MAX - VALOR_MIN) / (VOLTAJE_MAX - VOLTAJE_MIN))) + VALOR_MIN;
+        
+        lastSensorReadMillis = millis();
+    }
     
     yield();
 }
