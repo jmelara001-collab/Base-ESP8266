@@ -13,7 +13,7 @@ unsigned long wifiDownMillis = 0;
 const unsigned long RESTART_TIMEOUT = 300000; // 5 minutos de espera offline (WiFi o SSL) antes de reiniciar radio
 
 String user_html = "";  
-char* ssid_pfix = (char*)"Kinco";
+char* ssid_pfix = (char*)"IOT_Device";
 
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
@@ -21,20 +21,9 @@ int defaultPubIntervalMs = 5000;
 uint32_t reconnecciones_wifi = 0;   
 bool wifiWasConnected = false;      
 
-// --- VARIABLES DE CONTEO Y ESCALA ---
-const int PIN_SENSOR = 18; 
-const int LED_PIN = 2;
-
-unsigned long FILTRO_MS = 10;       // Milisegundos para evitar el rebote del sensor
-uint32_t PULSOS_POR_UNIDAD = 1;   // Cuántos pulsos equivalen a 1 unidad (producto final)
-int TIPO_FLANCO = HIGH;             // HIGH = Cuenta al subir, LOW = Cuenta al bajar
-
-uint32_t contador_pulsos_total = 0; // Acumula cada pulso físico individual
-uint32_t total_unidades_historico = 0; // Acumula las unidades completas calculadas
-
-int estado_sensor_crudo = LOW;      // Lo que lee digitalRead al instante
-int estado_sensor_validado = LOW;   // El estado después de pasar el filtro
-unsigned long tiempo_ultimo_cambio = 0; 
+// --- VARIABLES DE TU PROCESO ---
+// (Agrega aquí las variables de tu propio proceso)
+const int LED_PIN = 2; // Se mantiene para indicar el envío de datos MQTT
 
 // --- TAREA PARA EL CORE 0 (RED) ---
 TaskHandle_t NetworkTaskHandle;
@@ -47,19 +36,13 @@ void handleUserMeta() {
         pubInterval = cfg["meta"]["pubInterval"].as<int>();
         if (pubInterval < 200) pubInterval = 200;
     }
-    // Ajuste dinámico de parámetros sin reprogramar
-    if (cfg["meta"].containsKey("filtro_ms")) {
-        FILTRO_MS = cfg["meta"]["filtro_ms"].as<unsigned long>();
-    }
-    if (cfg["meta"].containsKey("pulsos_unidad")) {
-        PULSOS_POR_UNIDAD = cfg["meta"]["pulsos_unidad"].as<uint32_t>();
-    }
-    if (cfg["meta"].containsKey("flanco")) {
-        TIPO_FLANCO = cfg["meta"]["flanco"].as<int>();
-    }
+    
+    // (Agrega aquí el ajuste dinámico de parámetros de tu proceso)
 }
 
-void handleUserCommand(char* topic, JsonDocument* root) {}
+void handleUserCommand(char* topic, JsonDocument* root) {
+    // (Manejo de comandos entrantes de tu proceso)
+}
 
 // ---------------------------------------------------------------------------
 // PUBLICACIÓN DE DATOS MQTT (Llamada desde la tarea de red)
@@ -68,15 +51,13 @@ void publishData() {
     StaticJsonDocument<768> root; 
     JsonObject data = root.createNestedObject("d");
 
-    // Enviamos el conteo de forma genérica
-    data["unidades_totales"] = total_unidades_historico;
-    data["pulsos_totales"] = contador_pulsos_total;
+    // --- VARIABLES DE TU PROCESO ---
+    // Ejemplo: data["mi_sensor"] = valor_sensor;
     
-    // Variables de estado original
+    // --- VARIABLES DE ESTADO ORIGINAL (ESQUELETO) ---
     data["uptime"] = millis() / 1000;          
     data["reconn"] = reconnecciones_wifi;     
-    data["heap"]   = ESP.getFreeHeap();       
-    data["d18_logic"] = digitalRead(PIN_SENSOR);
+    data["heap"]   = ESP.getFreeHeap();        
     data["wifi_ok"]   = (WiFi.status() == WL_CONNECTED);
     data["wifi_rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
     data["status"] = "Online";
@@ -88,7 +69,7 @@ void publishData() {
             digitalWrite(LED_PIN, HIGH);
             delay(50); 
             digitalWrite(LED_PIN, LOW);
-            Serial.printf("TX OK | Unidades: %u | Pulsos: %u\n", total_unidades_historico, contador_pulsos_total);
+            Serial.printf("TX OK | Uptime: %lu\n", millis() / 1000);
         }
     }
 }
@@ -158,9 +139,11 @@ void core0NetworkTask(void * pvParameters) {
 void setup() {
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n[BOOT] Iniciando sistema de conteo por pulsos (Modo Acumulador Ciego)...");
+    Serial.println("\n[BOOT] Iniciando sistema");
 
-    pinMode(PIN_SENSOR, INPUT); 
+    // --- CONFIGURACIÓN DE PINES DE TU PROCESO ---
+    // (Tus pinMode van aquí)
+    
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW); 
 
@@ -206,31 +189,12 @@ void setup() {
 }
 
 // ---------------------------------------------------------------------------
-// LOOP PRINCIPAL (Lógica de conteo con antirrebote, SIN PARADA POR TIMEOUT)
+// LOOP PRINCIPAL 
 // ---------------------------------------------------------------------------
 void loop() {
-    int lectura_actual = digitalRead(PIN_SENSOR);
-
-    // 1. Detectar cualquier cambio instantáneo y reiniciar el reloj del filtro
-    if (lectura_actual != estado_sensor_crudo) {
-        tiempo_ultimo_cambio = millis();
-        estado_sensor_crudo = lectura_actual;
-    }
-
-    // 2. Si el sensor se quedó estable por el tiempo dictado en FILTRO_MS
-    if ((millis() - tiempo_ultimo_cambio) > FILTRO_MS) {
-        
-        // 3. Revisar si este estado estable es un estado "nuevo" validado
-        if (estado_sensor_crudo != estado_sensor_validado) {
-            estado_sensor_validado = estado_sensor_crudo;
-
-            // 4. ¿El cambio coincide con el flanco que queremos leer?
-            if (estado_sensor_validado == TIPO_FLANCO) {
-                contador_pulsos_total++; // ¡Pasó un pulso válido!
-                
-                // 5. Cálculo automático de unidades completas
-                total_unidades_historico = contador_pulsos_total / PULSOS_POR_UNIDAD;
-            }
-        }
-    }
+    // --- LÓGICA DE TU PROCESO AQUÍ ---
+    // Este espacio queda libre para que programes tu aplicación
+    
+    
+    vTaskDelay(pdMS_TO_TICKS(10)); // Pequeño retardo recomendado si el loop está vacío o corre muy rápido
 }
