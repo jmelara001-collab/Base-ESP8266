@@ -13,7 +13,7 @@ unsigned long wifiDownMillis = 0;
 const unsigned long RESTART_TIMEOUT = 300000; 
 
 String user_html = "";  
-char* ssid_pfix = (char*)"VMB-33";
+char* ssid_pfix = (char*)"VVB-33";
 
 unsigned long lastPublishMillis = 0;
 int defaultPubIntervalMs = 5000;
@@ -23,10 +23,10 @@ bool wifiWasConnected = false;
 
 // --- VARIABLES DE TU PROCESO ---
 const float VOLTAJE_MIN = 0.0; 
-const float VOLTAJE_MAX = 3.3;
+const float VOLTAJE_MAX = 3.25;
 
-const float VALOR_MIN = 8.0;       
-const float VALOR_MAX = 150.0;     
+const float VALOR_MIN = 0.0;       
+const float VALOR_MAX = 7634.0;     
 
 const int LED_PIN = 2;
 
@@ -62,7 +62,7 @@ void publishData() {
     // --- VARIABLES DE TU PROCESO ---
     data["adc_raw"] = adc_raw;
     data["voltaje"] = voltaje;
-    data["unidades"]  = medicion_final; 
+    data["plgo/h"]  = medicion_final; 
     
     // --- VARIABLES DE ESTADO ORIGINAL ---
     data["uptime"]    = millis() / 1000;           
